@@ -463,3 +463,8 @@ Apache License 2.0 - see [LICENSE](LICENSE) for details.
 
 Made with ❤️ by [CoreBaseHQ](https://github.com/corebasehq)
 
+
+## Hosted deployment
+
+A hosted deployment is available on [Fronteir AI](https://fronteir.ai/mcp/corebasehq-coremcp).
+
