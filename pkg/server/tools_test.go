@@ -250,7 +250,7 @@ func TestCustomToolSQLInjectionBlocked(t *testing.T) {
 	}
 
 	intInjections := []string{
-		"1 OR 1=1",      // logic-injection without quotes/semicolons — previously bypassed denylist
+		"1 OR 1=1", // logic-injection without quotes/semicolons — previously bypassed denylist
 		"1; DROP TABLE users",
 		"1' OR '1'='1",
 		"1 -- comment",

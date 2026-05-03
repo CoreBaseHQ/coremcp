@@ -72,17 +72,17 @@ func buildTestServer(t *testing.T) *httptest.Server {
 			},
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(spec)
+		_ = json.NewEncoder(w).Encode(spec)
 	})
 
 	mux.HandleFunc("/users/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{"id": "42", "name": "Alice"})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"id": "42", "name": "Alice"})
 	})
 
 	mux.HandleFunc("/users", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]map[string]interface{}{
+		_ = json.NewEncoder(w).Encode([]map[string]interface{}{
 			{"id": "1", "name": "Alice"},
 			{"id": "2", "name": "Bob"},
 		})
@@ -418,7 +418,7 @@ func TestRESTAdapter_ExecuteProcedure_QueryParam(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedQuery = r.URL.RawQuery
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]interface{}{})
+		_ = json.NewEncoder(w).Encode([]interface{}{})
 	}))
 	defer srv.Close()
 
@@ -458,9 +458,9 @@ func TestRESTAdapter_ExecuteProcedure_QueryParam(t *testing.T) {
 func TestRESTAdapter_ExecuteProcedure_POSTWithBody(t *testing.T) {
 	var receivedBody map[string]string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewDecoder(r.Body).Decode(&receivedBody)
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"ok": "true"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"ok": "true"})
 	}))
 	defer srv.Close()
 
@@ -589,7 +589,7 @@ func TestRESTAdapter_DiscoverFromSpec_NonOKStatus(t *testing.T) {
 
 func TestRESTAdapter_DiscoverFromSpec_InvalidJSON(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("not-json"))
+		_, _ = w.Write([]byte("not-json"))
 	}))
 	defer srv.Close()
 

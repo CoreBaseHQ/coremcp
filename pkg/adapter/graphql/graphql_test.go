@@ -30,7 +30,7 @@ func minimalIntrospectionResponse(queryTypeName, mutationTypeName string) map[st
 					"args": []map[string]interface{}{
 						{
 							"name": "id", "description": "User ID",
-							"type": map[string]interface{}{"kind": "NON_NULL", "name": nil, "ofType": map[string]interface{}{"kind": "SCALAR", "name": "ID", "ofType": nil}},
+							"type":         map[string]interface{}{"kind": "NON_NULL", "name": nil, "ofType": map[string]interface{}{"kind": "SCALAR", "name": "ID", "ofType": nil}},
 							"defaultValue": nil,
 						},
 					},
@@ -109,18 +109,18 @@ func buildGraphQLServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req map[string]interface{}
-		json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewDecoder(r.Body).Decode(&req)
 
 		query, _ := req["query"].(string)
 		w.Header().Set("Content-Type", "application/json")
 
 		if strings.Contains(query, "__schema") {
-			json.NewEncoder(w).Encode(minimalIntrospectionResponse("Query", "Mutation"))
+			_ = json.NewEncoder(w).Encode(minimalIntrospectionResponse("Query", "Mutation"))
 			return
 		}
 
 		// Regular query response
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"data": map[string]interface{}{
 				"user": map[string]interface{}{"id": "1", "name": "Alice"},
 			},
@@ -459,12 +459,12 @@ func TestGraphQLAdapter_ExecuteQuery_WithVariables(t *testing.T) {
 	var receivedVars map[string]interface{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req map[string]interface{}
-		json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewDecoder(r.Body).Decode(&req)
 		if vars, ok := req["variables"].(map[string]interface{}); ok {
 			receivedVars = vars
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{"data": map[string]interface{}{}})
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"data": map[string]interface{}{}})
 	}))
 	defer srv.Close()
 
@@ -503,10 +503,10 @@ func TestGraphQLAdapter_ExecuteProcedure_QueryNoParams(t *testing.T) {
 	var receivedQuery string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req map[string]interface{}
-		json.NewDecoder(r.Body).Decode(&req)
+		_ = json.NewDecoder(r.Body).Decode(&req)
 		receivedQuery, _ = req["query"].(string)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"data": map[string]interface{}{"users": []interface{}{}},
 		})
 	}))
@@ -533,9 +533,9 @@ func TestGraphQLAdapter_ExecuteProcedure_QueryNoParams(t *testing.T) {
 func TestGraphQLAdapter_ExecuteProcedure_MutationWithParams(t *testing.T) {
 	var receivedBody map[string]interface{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewDecoder(r.Body).Decode(&receivedBody)
+		_ = json.NewDecoder(r.Body).Decode(&receivedBody)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"data": map[string]interface{}{"createUser": map[string]interface{}{"id": "10"}},
 		})
 	}))
@@ -568,7 +568,7 @@ func TestGraphQLAdapter_ExecuteProcedure_MutationWithParams(t *testing.T) {
 func TestGraphQLAdapter_ExecuteGraphQL_ReturnsGraphQLErrors(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"errors": []map[string]interface{}{
 				{"message": "field 'foo' not found"},
 			},
@@ -675,7 +675,7 @@ func TestGraphQLAdapter_IsNonNull(t *testing.T) {
 
 func TestGraphQLAdapter_Introspect_InvalidJSON(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("not json"))
+		_, _ = w.Write([]byte("not json"))
 	}))
 	defer srv.Close()
 
@@ -694,7 +694,7 @@ func TestGraphQLAdapter_Introspect_InvalidJSON(t *testing.T) {
 func TestGraphQLAdapter_Introspect_GraphQLError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"errors": []map[string]interface{}{{"message": "not authorized"}},
 		})
 	}))
@@ -744,7 +744,7 @@ func TestGraphQLAdapter_FindType_Found(t *testing.T) {
 func TestGraphQLAdapter_GetOperations_OnlyQueryType(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(minimalIntrospectionResponse("Query", ""))
+		_ = json.NewEncoder(w).Encode(minimalIntrospectionResponse("Query", ""))
 	}))
 	defer srv.Close()
 

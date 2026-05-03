@@ -34,7 +34,7 @@ var identifierRe = regexp.MustCompile(`^[A-Za-z0-9_]+$`)
 //   - "number"     — value must parse as a 64-bit float; interpolated bare
 //   - "date"       — value must match YYYY-MM-DD; interpolated bare (use quotes in template)
 //   - "identifier" — value must match ^[A-Za-z0-9_]+$; safe for unquoted interpolation
-//   - "string"     — default; single quotes are escaped ('→'') for safe interpolation inside
+//   - "string"     — default; single quotes are escaped ('→”) for safe interpolation inside
 //     SQL string literals — always wrap {{param}} in quotes in the template
 type ToolParam struct {
 	Name     string
