@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.6] - 2026-05-02
+
+### Added
+- **REST API adapter (`type: rest`):** Connect to any REST/OpenAPI-based service as a CoreMCP source. Discovers endpoints from an OpenAPI 3.0 spec at startup and exposes them as MCP tools. Configure with `base_url`, `api_key`, `spec_url`, `headers`, and `timeout` — no raw DSN required; `BuildDSN()` compiles a `rest://` connection string automatically.
+- **GraphQL adapter (`type: graphql`):** Connect to GraphQL APIs with automatic schema introspection. Maps every query and mutation to an MCP tool. Configure with `base_url`, `api_key`, `headers`, and `timeout`; DSN is built as `graphql://` automatically.
+- **Semantic context in `get_schema` responses:** The CoreBase control plane can now push business-layer annotations (table/column descriptions, glossary terms, virtual JOIN hints) to the agent via `config_sync`. These are stored per-source in `ConnectClient` and attached to every `get_schema` response so the LLM receives full semantic enrichment without a round-trip.
+- **`SourceConfig.BuildDSN()`:** New method on `SourceConfig` that constructs the adapter DSN from structured fields (`base_url`, `api_key`, `spec_url`, `headers`, `timeout`) for REST and GraphQL sources. Existing database sources and configs that already provide a `dsn` field are unaffected.
+
+### Changed
+- `coremcp.example.yaml` updated with commented REST and GraphQL source examples, updated DSN format reference, and server version bumped to `0.4.6`.
+- `adapter.NewSource` error message changed to lower-case (`"unsupported DB type: %s"`) for consistency with Go error conventions.
+
 ## [0.4.5] - 2026-03-26
 
 ### Changed

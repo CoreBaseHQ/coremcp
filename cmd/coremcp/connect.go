@@ -75,9 +75,20 @@ type ResponsePayload struct {
 }
 
 type ConfigSyncPayload struct {
-	Sources      []RemoteSource `json:"sources"`
-	Security     RemoteSecurity `json:"security"`
-	RefreshToken string         `json:"refresh_token,omitempty"`
+	Sources         []RemoteSource                   `json:"sources"`
+	Security        RemoteSecurity                   `json:"security"`
+	RefreshToken    string                           `json:"refresh_token,omitempty"`
+	SemanticContext map[string]SemanticSourceContext `json:"semantic_context,omitempty"`
+}
+
+// SemanticSourceContext carries business-layer annotations for a single source:
+// table/column descriptions, glossary terms, and virtual JOIN hints. Built by
+// the Python control plane from user-managed schema annotations and forwarded
+// to the agent so it can be returned with get_schema results for LLM prompting.
+type SemanticSourceContext struct {
+	Tables   map[string]string                 `json:"tables"`
+	Columns  map[string]map[string]string      `json:"columns"`
+	Glossary map[string]map[string]interface{} `json:"glossary"`
 }
 
 type RemoteSource struct {
@@ -98,20 +109,21 @@ type RemoteSecurity struct {
 
 // ConnectClient manages WebSocket connection to CoreBase Cloud
 type ConnectClient struct {
-	serverURL      string
-	token          string
-	conn           *websocket.Conn
-	mu             sync.RWMutex
-	writeMu        sync.Mutex // Protects WebSocket writes
-	sources        map[string]core.Source
-	ctx            context.Context
-	cancel         context.CancelFunc
-	reconnectDelay time.Duration
-	maxReconnect   int
-	agentID        string
-	hostname       string
-	queryValidator *security.QueryValidator
-	queryModifier  *security.QueryModifier
+	serverURL       string
+	token           string
+	conn            *websocket.Conn
+	mu              sync.RWMutex
+	writeMu         sync.Mutex // Protects WebSocket writes
+	sources         map[string]core.Source
+	semanticContext map[string]SemanticSourceContext
+	ctx             context.Context
+	cancel          context.CancelFunc
+	reconnectDelay  time.Duration
+	maxReconnect    int
+	agentID         string
+	hostname        string
+	queryValidator  *security.QueryValidator
+	queryModifier   *security.QueryModifier
 }
 
 var connectCmd = &cobra.Command{
@@ -180,17 +192,18 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
 	client := &ConnectClient{
-		serverURL:      serverURL,
-		token:          token,
-		sources:        make(map[string]core.Source),
-		ctx:            ctx,
-		cancel:         cancel,
-		reconnectDelay: reconnectDelay,
-		maxReconnect:   maxReconnect,
-		agentID:        agentID,
-		hostname:       hostname,
-		queryValidator: security.NewQueryValidator(nil, nil),
-		queryModifier:  security.NewQueryModifier(1000),
+		serverURL:       serverURL,
+		token:           token,
+		sources:         make(map[string]core.Source),
+		semanticContext: make(map[string]SemanticSourceContext),
+		ctx:             ctx,
+		cancel:          cancel,
+		reconnectDelay:  reconnectDelay,
+		maxReconnect:    maxReconnect,
+		agentID:         agentID,
+		hostname:        hostname,
+		queryValidator:  security.NewQueryValidator(nil, nil),
+		queryModifier:   security.NewQueryModifier(1000),
 	}
 
 	fmt.Fprintf(os.Stderr, "[INFO] CoreMCP Connect Mode\n")
@@ -450,7 +463,7 @@ func (c *ConnectClient) handleConfigSync(msg *WSMessage) {
 	c.queryModifier = security.NewQueryModifier(configPayload.Security.MaxRowLimit)
 	c.mu.Unlock()
 
-	// Close existing sources
+	// Close existing sources and reset semantic context to match new config.
 	c.mu.Lock()
 	for name, src := range c.sources {
 		if err := src.Close(c.ctx); err != nil {
@@ -458,7 +471,19 @@ func (c *ConnectClient) handleConfigSync(msg *WSMessage) {
 		}
 		delete(c.sources, name)
 	}
+	if configPayload.SemanticContext != nil {
+		c.semanticContext = configPayload.SemanticContext
+	} else {
+		c.semanticContext = make(map[string]SemanticSourceContext)
+	}
 	c.mu.Unlock()
+
+	semanticCount := 0
+	for _, sc := range configPayload.SemanticContext {
+		semanticCount += len(sc.Tables) + len(sc.Glossary)
+	}
+	log.Printf("[INFO] Semantic context: %d source(s), %d annotation/glossary entries",
+		len(configPayload.SemanticContext), semanticCount)
 
 	// Create new sources from remote config
 	for _, remoteSrc := range configPayload.Sources {
@@ -538,6 +563,7 @@ func (c *ConnectClient) executeSQL(sourceName, query string, params map[string]i
 func (c *ConnectClient) getSchema(sourceName string) (interface{}, error) {
 	c.mu.RLock()
 	src, exists := c.sources[sourceName]
+	semantic, hasSemantic := c.semanticContext[sourceName]
 	c.mu.RUnlock()
 
 	if !exists {
@@ -558,12 +584,17 @@ func (c *ConnectClient) getSchema(sourceName string) (interface{}, error) {
 
 	log.Printf("[INFO] Schema retrieved successfully in %v", retrievalTime)
 
-	// Format response with metadata
+	// Format response with metadata. Semantic context (table/column descriptions
+	// + glossary, pushed by Python control plane via config_sync) is attached so
+	// the LLM-facing layer can render business meaning alongside raw schema.
 	response := map[string]interface{}{
 		"schema":         schema,
 		"retrieval_time": retrievalTime.Milliseconds(),
 		"source":         sourceName,
 		"timestamp":      time.Now().Unix(),
+	}
+	if hasSemantic {
+		response["semantic_context"] = semantic
 	}
 
 	return response, nil

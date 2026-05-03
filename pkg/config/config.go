@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,11 +53,17 @@ type LoggingConfig struct {
 
 type SourceConfig struct {
 	Name             string `mapstructure:"name"`
-	Type             string `mapstructure:"type"` // mssql, firebird, postgres
+	Type             string `mapstructure:"type"` // mssql, firebird, postgres, rest, graphql
 	DSN              string `mapstructure:"dsn"`  // Data Source Name (Connection String)
 	ReadOnly         *bool  `mapstructure:"readonly"`
 	NoLock           bool   `mapstructure:"no_lock"`           // MSSQL: Use READ UNCOMMITTED isolation (equivalent to WITH (NOLOCK))
 	NormalizeTurkish bool   `mapstructure:"normalize_turkish"` // Normalize Turkish chars in SQL literals (for legacy Turkish_CI_AS databases)
+	// REST/GraphQL specific fields
+	BaseURL string            `mapstructure:"base_url"` // Base URL for REST/GraphQL APIs
+	APIKey  string            `mapstructure:"api_key"`  // API key (will be encrypted at rest)
+	SpecURL string            `mapstructure:"spec_url"` // OpenAPI spec URL for REST
+	Headers map[string]string `mapstructure:"headers"`  // Custom headers for REST/GraphQL
+	Timeout int               `mapstructure:"timeout"`  // Request timeout in seconds (default: 30)
 }
 
 // IsReadOnly returns true if this source is read-only (defaults to true when not explicitly set).
@@ -65,6 +72,99 @@ func (s SourceConfig) IsReadOnly() bool {
 		return true
 	}
 	return *s.ReadOnly
+}
+
+// BuildDSN builds the connection string (DSN) for this source.
+// For REST/GraphQL sources, it constructs the DSN from BaseURL, APIKey, and other fields.
+// For database sources, it returns the configured DSN.
+func (s SourceConfig) BuildDSN() string {
+	// If DSN is already provided, use it (backward compatibility)
+	if s.DSN != "" {
+		return s.DSN
+	}
+
+	// Build DSN for REST/GraphQL sources
+	switch s.Type {
+	case "rest":
+		return s.buildRESTDSN()
+	case "graphql":
+		return s.buildGraphQLDSN()
+	default:
+		return s.DSN
+	}
+}
+
+func (s SourceConfig) buildRESTDSN() string {
+	if s.BaseURL == "" {
+		return ""
+	}
+
+	u, err := url.Parse(s.BaseURL)
+	if err != nil {
+		return ""
+	}
+
+	// Convert to rest:// scheme
+	u.Scheme = "rest"
+
+	q := u.Query()
+
+	// Add API key if provided
+	if s.APIKey != "" {
+		q.Set("apiKey", s.APIKey)
+	}
+
+	// Add spec URL if provided
+	if s.SpecURL != "" {
+		q.Set("specURL", s.SpecURL)
+	}
+
+	// Add custom headers
+	for k, v := range s.Headers {
+		q.Set("header_"+k, v)
+	}
+
+	// Add timeout if specified
+	if s.Timeout > 0 {
+		q.Set("timeout", fmt.Sprintf("%d", s.Timeout))
+	}
+
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
+func (s SourceConfig) buildGraphQLDSN() string {
+	if s.BaseURL == "" {
+		return ""
+	}
+
+	u, err := url.Parse(s.BaseURL)
+	if err != nil {
+		return ""
+	}
+
+	// Convert to graphql:// scheme
+	u.Scheme = "graphql"
+
+	q := u.Query()
+
+	// Add API key if provided
+	if s.APIKey != "" {
+		q.Set("apiKey", s.APIKey)
+	}
+
+	// Add custom headers
+	for k, v := range s.Headers {
+		q.Set("header_"+k, v)
+	}
+
+	// Add timeout if specified
+	if s.Timeout > 0 {
+		q.Set("timeout", fmt.Sprintf("%d", s.Timeout))
+	}
+
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 // CustomToolConfig defines a custom MCP tool with a predefined query.

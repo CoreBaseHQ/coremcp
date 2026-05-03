@@ -3,7 +3,7 @@
 
 server:
   name: "coremcp-agent"
-  version: "0.4.0"
+  version: "0.4.6"
   transport: "stdio"  # stdio (for Claude Desktop) or http (for remote server)
   port: 8080          # Only used in http mode
 
@@ -43,6 +43,34 @@ sources:
   #                            # Outgoing: 'Huseyin' to 'HUSEYIN', 'seker' to 'SEKER' inside WHERE clauses
   #                            # Incoming: auto-corrects Windows-1254 / Windows-1252 mojibake in results
 
+  # Example: REST API (OpenAPI/Swagger)
+  # Use `base_url` + optional `spec_url` and `api_key` instead of a raw dsn.
+  # CoreMCP discovers endpoints from the OpenAPI spec at startup and exposes
+  # each path as an MCP tool. Without a spec_url the adapter still allows
+  # query_database calls against arbitrary paths.
+  # - name: "stripe_api"
+  #   type: "rest"
+  #   base_url: "https://api.stripe.com/v1"
+  #   api_key: "sk_live_..."       # sent as "Authorization: Bearer <api_key>"
+  #   spec_url: "https://api.stripe.com/openapi.json"  # optional OpenAPI discovery
+  #   readonly: true               # REST sources default to read-only
+  #   timeout: 30                  # request timeout in seconds (default: 30)
+  #   headers:                     # any extra HTTP headers
+  #     Stripe-Version: "2024-06-20"
+
+  # Example: GraphQL API (with introspection)
+  # CoreMCP sends an introspection query on connect and maps every query /
+  # mutation to an MCP tool.  Set introspection_enabled: false on the
+  # matching API connection in the CoreBase panel if the server blocks it.
+  # - name: "shopify_gql"
+  #   type: "graphql"
+  #   base_url: "https://mystore.myshopify.com/api/2024-01/graphql.json"
+  #   api_key: "shpat_..."         # sent as "Authorization: Bearer <api_key>"
+  #   readonly: true
+  #   timeout: 30
+  #   headers:
+  #     X-Shopify-Access-Token: "shpat_..."
+
   # Example: Firebird (not implemented yet)
   # - name: "legacy_db"
   #   type: "firebird"
@@ -50,8 +78,12 @@ sources:
   #   readonly: true
 
 # DSN Format Examples:
-# MSSQL:  sqlserver://username:password@host:port?database=dbname&encrypt=disable
-# Dummy:  dummy://anything
+# MSSQL:    sqlserver://username:password@host:port?database=dbname&encrypt=disable
+# REST:     rest://api.example.com/v1?apiKey=xxx&specURL=https://…/openapi.json
+#             (built automatically from base_url / api_key / spec_url / headers)
+# GraphQL:  graphql://api.example.com/graphql?apiKey=xxx
+#             (built automatically from base_url / api_key / headers)
+# Dummy:    dummy://anything
 #
 # MSSQL Version Support (auto-detected - no manual config required):
 #   SQL Server 2000  (v8)  - sysobjects/sysforeignkeys; no column descriptions
