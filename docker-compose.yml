@@ -1,6 +1,6 @@
 services:
   coremcp:
-    image: corebasehq/coremcp:latest
+    image: y11t0/coremcp:latest
     container_name: coremcp
     restart: unless-stopped
     volumes:

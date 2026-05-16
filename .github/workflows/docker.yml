@@ -41,7 +41,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: |
-            corebasehq/coremcp
+            y11t0/coremcp
             ghcr.io/corebasehq/coremcp
           tags: |
             type=semver,pattern={{version}}

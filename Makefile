@@ -98,12 +98,12 @@ run: build
 ## docker-build: Build Docker image
 docker-build:
 	@echo "Building Docker image..."
-	docker build -t corebasehq/coremcp:$(VERSION) .
-	docker tag corebasehq/coremcp:$(VERSION) corebasehq/coremcp:latest
+	docker build -t y11t0/coremcp:$(VERSION) .
+	docker tag y11t0/coremcp:$(VERSION) y11t0/coremcp:latest
 
 ## docker-run: Run Docker container
 docker-run:
-	docker run --rm -v $(PWD)/coremcp.yaml:/app/coremcp.yaml corebasehq/coremcp:latest
+	docker run --rm -v $(PWD)/coremcp.yaml:/app/coremcp.yaml y11t0/coremcp:latest
 
 ## help: Show this help message
 help:
