@@ -1,35 +1,15 @@
-# CoreMCP Docker
-
-version: '3.8'
-
 services:
   coremcp:
-    build: .
     image: corebasehq/coremcp:latest
     container_name: coremcp
+    restart: unless-stopped
     volumes:
-      # Mount your config file
       - ./coremcp.yaml:/app/coremcp.yaml:ro
     environment:
-      # Override config via environment variables if needed
-      # - COREMCP_SERVER_NAME=coremcp-docker
-      # - COREMCP_SERVER_TRANSPORT=stdio
       - TZ=UTC
-    restart: unless-stopped
-
-  # Example: MSSQL database for testing
-  mssql:
-    image: mcr.microsoft.com/mssql/server:2019-latest
-    container_name: coremcp-mssql
-    environment:
-      - ACCEPT_EULA=Y
-      - SA_PASSWORD=YourStrong@Passw0rd
-      - MSSQL_PID=Developer
-    ports:
-      - "1433:1433"
-    volumes:
-      - mssql-data:/var/opt/mssql
-    restart: unless-stopped
-
-volumes:
-  mssql-data:
+    # Default CMD runs `coremcp serve --config /app/coremcp.yaml`.
+    # For stdio transport (e.g. embedded MCP client), override CMD to:
+    #   command: ["serve", "--config", "/app/coremcp.yaml", "--transport", "stdio"]
+    # For HTTP transport, expose the port:
+    # ports:
+    #   - "8080:8080"
