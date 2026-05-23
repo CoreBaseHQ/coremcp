@@ -1,13 +1,16 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/corebasehq/coremcp/pkg/adapter"
 	"github.com/corebasehq/coremcp/pkg/config"
+	"github.com/corebasehq/coremcp/pkg/core"
 	"github.com/corebasehq/coremcp/pkg/security"
 	"github.com/corebasehq/coremcp/pkg/server"
 	"github.com/spf13/cobra"
@@ -16,11 +19,11 @@ import (
 var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Starts the MCP server",
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		log.SetOutput(os.Stderr)
 
 		if cfg == nil {
-			log.Fatal("Failed to load configuration")
+			return fmt.Errorf("failed to load configuration")
 		}
 
 		fmt.Fprintf(os.Stderr, "Starting CoreMCP Server via %s...\n", cfg.Server.Transport)
@@ -37,10 +40,33 @@ var serveCmd = &cobra.Command{
 			cfg.Security.AllowedKeywords,
 			cfg.Security.BlockedKeywords,
 		); err != nil {
-			log.Fatalf("CRITICAL: Failed to configure security: %v", err)
+			return fmt.Errorf("failed to configure security: %w", err)
 		}
 		log.Printf("Security configured: MaxRowLimit=%d, PIIMasking=%v",
 			cfg.Security.MaxRowLimit, cfg.Security.EnablePIIMasking)
+
+		connectedSources := make(map[string]core.Source)
+		var schemaWG sync.WaitGroup
+		defer func() {
+			schemaWG.Wait()
+			if len(connectedSources) == 0 {
+				return
+			}
+			perSourceTimeout := 5 * time.Second
+			var closeWG sync.WaitGroup
+			for name, src := range connectedSources {
+				closeWG.Add(1)
+				go func(name string, src core.Source) {
+					defer closeWG.Done()
+					cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), perSourceTimeout)
+					defer cleanupCancel()
+					if err := src.Close(cleanupCtx); err != nil {
+						log.Printf("WARNING: Failed to close source %s: %v", name, err)
+					}
+				}(name, src)
+			}
+			closeWG.Wait()
+		}()
 
 		for _, sourceCfg := range cfg.Sources {
 			src, err := adapter.NewSource(sourceCfg.Type, sourceCfg.DSN, sourceCfg.NoLock, sourceCfg.NormalizeTurkish)
@@ -53,6 +79,7 @@ var serveCmd = &cobra.Command{
 				log.Printf("ERROR: Failed to connect to database %s: %v — skipping source", sourceCfg.Name, err)
 				continue
 			}
+			connectedSources[sourceCfg.Name] = src
 
 			mcpSrv.AddSource(sourceCfg.Name, src, sourceCfg.IsReadOnly())
 			log.Printf("Source ready: %s (%s) [ReadOnly: %v, NoLock: %v, NormalizeTurkish: %v]", sourceCfg.Name, sourceCfg.Type, sourceCfg.IsReadOnly(), sourceCfg.NoLock, sourceCfg.NormalizeTurkish)
@@ -60,9 +87,10 @@ var serveCmd = &cobra.Command{
 
 		// Load database schemas for AI context in background
 		// so the MCP server can respond to initialize immediately
+		schemaWG.Add(1)
 		go func() {
+			defer schemaWG.Done()
 			log.Println("Loading database schemas for AI context (background)...")
-			time.Sleep(500 * time.Millisecond) // let stdio start first
 			if err := mcpSrv.LoadSchemas(cmd.Context()); err != nil {
 				log.Printf("WARNING: Failed to load schemas: %v", err)
 			} else {
@@ -102,10 +130,11 @@ var serveCmd = &cobra.Command{
 		if transport == "stdio" {
 			log.Println("CoreMCP started on Stdio. Waiting for MCP client...")
 			if err := mcpSrv.StartStdio(); err != nil {
-				log.Fatal(err)
+				return err
 			}
+			return nil
 		} else {
-			log.Fatal("HTTP transport is not supported yet.")
+			return fmt.Errorf("http transport is not supported yet")
 		}
 	},
 }

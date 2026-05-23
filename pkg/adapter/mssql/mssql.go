@@ -157,134 +157,121 @@ func (m *MSSQLAdapter) GetSchema(ctx context.Context) ([]core.TableSchema, error
 	}
 	defer rows.Close()
 
+	tableMap := make(map[string]*core.TableSchema)
 	var tableNames []string
+
 	for rows.Next() {
 		var tableName string
 		if err := rows.Scan(&tableName); err != nil {
 			return nil, err
 		}
+		tableMap[tableName] = &core.TableSchema{
+			Name:        tableName,
+			Columns:     []core.ColumnInfo{},
+			ForeignKeys: []core.ForeignKey{},
+			PrimaryKeys: []string{},
+		}
 		tableNames = append(tableNames, tableName)
 	}
-
-	// Now get detailed info for each table
-	var tables []core.TableSchema
-	for _, tableName := range tableNames {
-		schema, err := m.getTableDetail(ctx, tableName)
-		if err != nil {
-			// Log and continue with partial info
-			schema = core.TableSchema{
-				Name: tableName,
-				Columns: []core.ColumnInfo{
-					{Name: "(error loading columns)", DataType: "unknown"},
-				},
-			}
-		}
-		tables = append(tables, schema)
-	}
-
-	return tables, nil
-}
-
-func (m *MSSQLAdapter) getTableDetail(ctx context.Context, tableName string) (core.TableSchema, error) {
-	schema := core.TableSchema{
-		Name:        tableName,
-		Columns:     []core.ColumnInfo{},
-		ForeignKeys: []core.ForeignKey{},
-		PrimaryKeys: []string{},
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
 	// Get columns with descriptions.
-	// sys.extended_properties was introduced in SQL Server 2005; on SQL Server 2000
-	// we fall back to INFORMATION_SCHEMA.COLUMNS only (no column descriptions).
+	// We run one generic query for all tables.
 	var columnQuery string
 	if m.isPreSQL2005() {
 		columnQuery = `
 			SELECT
+				TABLE_NAME,
 				COLUMN_NAME,
 				DATA_TYPE,
 				IS_NULLABLE,
-				'' AS DESCRIPTION
+				CAST('' AS NVARCHAR(4000)) AS DESCRIPTION
 			FROM INFORMATION_SCHEMA.COLUMNS
-			WHERE TABLE_NAME = @p1
-			ORDER BY ORDINAL_POSITION
+			ORDER BY TABLE_NAME, ORDINAL_POSITION
 		`
 	} else {
 		columnQuery = `
 			SELECT
+				c.TABLE_NAME,
 				c.COLUMN_NAME,
 				c.DATA_TYPE,
 				c.IS_NULLABLE,
-				ISNULL(ep.value, '') as DESCRIPTION
+				ISNULL(CAST(ep.value AS NVARCHAR(4000)), '') as DESCRIPTION
 			FROM INFORMATION_SCHEMA.COLUMNS c
 			LEFT JOIN sys.extended_properties ep
 				ON ep.major_id = OBJECT_ID(c.TABLE_SCHEMA + '.' + c.TABLE_NAME)
 				AND ep.minor_id = c.ORDINAL_POSITION
 				AND ep.name = 'MS_Description'
-			WHERE c.TABLE_NAME = @p1
-			ORDER BY c.ORDINAL_POSITION
+			ORDER BY c.TABLE_NAME, c.ORDINAL_POSITION
 		`
 	}
 
-	rows, err := m.db.QueryContext(ctx, columnQuery, tableName)
+	colRows, err := m.db.QueryContext(ctx, columnQuery)
 	if err != nil {
-		return schema, err
+		return nil, fmt.Errorf("failed to load column metadata: %w", err)
 	}
-	defer rows.Close()
-
-	for rows.Next() {
+	defer colRows.Close()
+	for colRows.Next() {
+		var tableName string
 		var col core.ColumnInfo
 		var isNullable string
 		var description sql.NullString
 
-		if err := rows.Scan(&col.Name, &col.DataType, &isNullable, &description); err != nil {
-			continue
+		if err := colRows.Scan(&tableName, &col.Name, &col.DataType, &isNullable, &description); err != nil {
+			return nil, err
 		}
 
-		col.IsNullable = (isNullable == "YES")
-		if description.Valid {
-			col.Description = description.String
+		if t, ok := tableMap[tableName]; ok {
+			col.IsNullable = (isNullable == "YES")
+			if description.Valid {
+				col.Description = description.String
+			}
+			t.Columns = append(t.Columns, col)
 		}
-
-		schema.Columns = append(schema.Columns, col)
+	}
+	if err := colRows.Err(); err != nil {
+		return nil, err
 	}
 
-	// Get primary keys
+	// Get primary keys for all tables
 	pkQuery := `
-		SELECT COLUMN_NAME
+		SELECT TABLE_NAME, COLUMN_NAME
 		FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
 		WHERE OBJECTPROPERTY(OBJECT_ID(CONSTRAINT_SCHEMA + '.' + CONSTRAINT_NAME), 'IsPrimaryKey') = 1
-		AND TABLE_NAME = @p1
-		ORDER BY ORDINAL_POSITION
+		ORDER BY TABLE_NAME, ORDINAL_POSITION
 	`
-
-	pkRows, err := m.db.QueryContext(ctx, pkQuery, tableName)
+	pkRows, err := m.db.QueryContext(ctx, pkQuery)
 	if err == nil {
 		defer pkRows.Close()
 		for pkRows.Next() {
-			var pkCol string
-			if err := pkRows.Scan(&pkCol); err == nil {
-				schema.PrimaryKeys = append(schema.PrimaryKeys, pkCol)
+			var tableName, pkCol string
+			if err := pkRows.Scan(&tableName, &pkCol); err == nil {
+				if t, ok := tableMap[tableName]; ok {
+					t.PrimaryKeys = append(t.PrimaryKeys, pkCol)
+				}
 			}
 		}
+		_ = pkRows.Err()
 	}
 
-	// Get foreign keys.
-	// sys.foreign_keys / sys.columns were introduced in SQL Server 2005.
-	// On SQL Server 2000 we use the legacy sysforeignkeys system table.
+	// Get foreign keys for all tables
 	var fkQuery string
 	if m.isPreSQL2005() {
 		fkQuery = `
 			SELECT
+				OBJECT_NAME(fk.fkeyid)            AS TABLE_NAME,
 				OBJECT_NAME(fk.constid)           AS FK_NAME,
 				COL_NAME(fk.fkeyid, fk.fkey)      AS COLUMN_NAME,
 				OBJECT_NAME(fk.rkeyid)            AS REFERENCED_TABLE,
 				COL_NAME(fk.rkeyid, fk.rkey)      AS REFERENCED_COLUMN
 			FROM sysforeignkeys fk
-			WHERE OBJECT_NAME(fk.fkeyid) = @p1
 		`
 	} else {
 		fkQuery = `
 			SELECT
+				OBJECT_NAME(fk.parent_object_id)   AS TABLE_NAME,
 				fk.name                            AS FK_NAME,
 				c1.name                            AS COLUMN_NAME,
 				OBJECT_NAME(fk.referenced_object_id) AS REFERENCED_TABLE,
@@ -293,22 +280,32 @@ func (m *MSSQLAdapter) getTableDetail(ctx context.Context, tableName string) (co
 			INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
 			INNER JOIN sys.columns c1 ON fkc.parent_object_id = c1.object_id AND fkc.parent_column_id = c1.column_id
 			INNER JOIN sys.columns c2 ON fkc.referenced_object_id = c2.object_id AND fkc.referenced_column_id = c2.column_id
-			WHERE OBJECT_NAME(fk.parent_object_id) = @p1
 		`
 	}
 
-	fkRows, err := m.db.QueryContext(ctx, fkQuery, tableName)
+	fkRows, err := m.db.QueryContext(ctx, fkQuery)
 	if err == nil {
 		defer fkRows.Close()
 		for fkRows.Next() {
+			var tableName string
 			var fk core.ForeignKey
-			if err := fkRows.Scan(&fk.ConstraintName, &fk.ColumnName, &fk.ReferencedTable, &fk.ReferencedColumn); err == nil {
-				schema.ForeignKeys = append(schema.ForeignKeys, fk)
+			if err := fkRows.Scan(&tableName, &fk.ConstraintName, &fk.ColumnName, &fk.ReferencedTable, &fk.ReferencedColumn); err == nil {
+				if t, ok := tableMap[tableName]; ok {
+					t.ForeignKeys = append(t.ForeignKeys, fk)
+				}
 			}
+		}
+		_ = fkRows.Err()
+	}
+
+	var tables []core.TableSchema
+	for _, name := range tableNames {
+		if t, ok := tableMap[name]; ok {
+			tables = append(tables, *t)
 		}
 	}
 
-	return schema, nil
+	return tables, nil
 }
 
 func (m *MSSQLAdapter) ExecuteQuery(ctx context.Context, query string, args ...any) (*core.QueryResult, error) {
@@ -339,51 +336,7 @@ func (m *MSSQLAdapter) ExecuteQuery(ctx context.Context, query string, args ...a
 	}
 	defer rows.Close()
 
-	columns, err := rows.Columns()
-	if err != nil {
-		return nil, err
-	}
-
-	count := len(columns)
-	values := make([]interface{}, count)
-	valuePtrs := make([]interface{}, count)
-
-	var finalRows []map[string]any
-
-	for rows.Next() {
-		for i := range columns {
-			valuePtrs[i] = &values[i]
-		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
-			return nil, err
-		}
-
-		// Make result JSON friendly
-		rowMap := make(map[string]any)
-		for i, col := range columns {
-			val := values[i]
-
-			// If data is []byte, convert to string for better JSON compatibility
-			if b, ok := val.([]byte); ok {
-				val = string(b)
-			}
-
-			// Middleware 3: Turkish mojibake fix (incoming)
-			// Corrects Windows-1254 chars misread as Windows-1252.
-			if m.normalizeTurkish {
-				val = turkish.FixResultValue(val)
-			}
-
-			rowMap[col] = val
-		}
-		finalRows = append(finalRows, rowMap)
-	}
-
-	return &core.QueryResult{
-		Columns: columns,
-		Rows:    finalRows,
-	}, nil
+	return m.parseRows(rows)
 }
 
 // ---------------------------------------------------------------------------
@@ -461,9 +414,9 @@ var safeProcName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_#@.]*$`)
 // GetViews retrieves all views from the database along with their column information.
 func (m *MSSQLAdapter) GetViews(ctx context.Context) ([]core.ViewSchema, error) {
 	viewQuery := `
-		SELECT TABLE_NAME
+		SELECT TABLE_SCHEMA, TABLE_NAME
 		FROM INFORMATION_SCHEMA.VIEWS
-		ORDER BY TABLE_NAME
+		ORDER BY TABLE_SCHEMA, TABLE_NAME
 	`
 	rows, err := m.db.QueryContext(ctx, viewQuery)
 	if err != nil {
@@ -471,41 +424,62 @@ func (m *MSSQLAdapter) GetViews(ctx context.Context) ([]core.ViewSchema, error) 
 	}
 	defer rows.Close()
 
+	viewMap := make(map[string]*core.ViewSchema)
 	var viewNames []string
 	for rows.Next() {
+		var schemaName string
 		var name string
-		if err := rows.Scan(&name); err != nil {
+		if err := rows.Scan(&schemaName, &name); err != nil {
 			return nil, err
 		}
-		viewNames = append(viewNames, name)
+		key := schemaName + "." + name
+		viewMap[key] = &core.ViewSchema{Name: key, Columns: []core.ColumnInfo{}}
+		viewNames = append(viewNames, key)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(viewNames) == 0 {
+		return []core.ViewSchema{}, nil
 	}
 
-	var views []core.ViewSchema
-	for _, viewName := range viewNames {
-		colQuery := `
-			SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
-			FROM INFORMATION_SCHEMA.COLUMNS
-			WHERE TABLE_NAME = @p1
-			ORDER BY ORDINAL_POSITION
-		`
-		colRows, err := m.db.QueryContext(ctx, colQuery, viewName)
-		if err != nil {
-			views = append(views, core.ViewSchema{Name: viewName})
-			continue
-		}
+	colQuery := `
+		SELECT c.TABLE_SCHEMA, c.TABLE_NAME, c.COLUMN_NAME, c.DATA_TYPE, c.IS_NULLABLE
+		FROM INFORMATION_SCHEMA.COLUMNS c
+		INNER JOIN INFORMATION_SCHEMA.VIEWS v
+			ON c.TABLE_NAME = v.TABLE_NAME
+			AND c.TABLE_SCHEMA = v.TABLE_SCHEMA
+		ORDER BY c.TABLE_SCHEMA, c.TABLE_NAME, c.ORDINAL_POSITION
+	`
+	colRows, err := m.db.QueryContext(ctx, colQuery)
+	if err != nil {
+		return nil, err
+	}
+	defer colRows.Close()
 
-		var cols []core.ColumnInfo
-		for colRows.Next() {
-			var col core.ColumnInfo
-			var nullable string
-			if err := colRows.Scan(&col.Name, &col.DataType, &nullable); err == nil {
-				col.IsNullable = (nullable == "YES")
-				cols = append(cols, col)
-			}
+	for colRows.Next() {
+		var schemaName string
+		var tableName string
+		var col core.ColumnInfo
+		var nullable string
+		if err := colRows.Scan(&schemaName, &tableName, &col.Name, &col.DataType, &nullable); err != nil {
+			return nil, err
 		}
-		colRows.Close()
+		key := schemaName + "." + tableName
+		if v, ok := viewMap[key]; ok {
+			col.IsNullable = (nullable == "YES")
+			v.Columns = append(v.Columns, col)
+		}
+	}
+	if err := colRows.Err(); err != nil {
+		return nil, err
+	}
 
-		views = append(views, core.ViewSchema{Name: viewName, Columns: cols})
+	views := make([]core.ViewSchema, 0, len(viewNames))
+	for _, key := range viewNames {
+		if v, ok := viewMap[key]; ok {
+			views = append(views, *v)
+		}
 	}
 
 	return views, nil
@@ -525,45 +499,63 @@ func (m *MSSQLAdapter) GetProcedures(ctx context.Context) ([]core.StoredProcedur
 	}
 	defer rows.Close()
 
+	procMap := make(map[string]*core.StoredProcedure)
 	var spNames []string
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
 			return nil, err
 		}
+		procMap[name] = &core.StoredProcedure{Name: name, Parameters: []core.ProcParameter{}}
 		spNames = append(spNames, name)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(spNames) == 0 {
+		return []core.StoredProcedure{}, nil
+	}
 
-	var procs []core.StoredProcedure
-	for _, spName := range spNames {
-		paramQuery := `
-			SELECT
-				PARAMETER_NAME,
-				DATA_TYPE,
-				PARAMETER_MODE
-			FROM INFORMATION_SCHEMA.PARAMETERS
-			WHERE SPECIFIC_NAME = @p1
-			  AND PARAMETER_NAME <> ''
-			ORDER BY ORDINAL_POSITION
-		`
-		paramRows, err := m.db.QueryContext(ctx, paramQuery, spName)
-		if err != nil {
-			procs = append(procs, core.StoredProcedure{Name: spName})
+	paramQuery := `
+		SELECT
+			SPECIFIC_NAME,
+			PARAMETER_NAME,
+			DATA_TYPE,
+			PARAMETER_MODE
+		FROM INFORMATION_SCHEMA.PARAMETERS
+		WHERE PARAMETER_NAME <> ''
+		ORDER BY SPECIFIC_NAME, ORDINAL_POSITION
+	`
+	paramRows, err := m.db.QueryContext(ctx, paramQuery)
+	if err != nil {
+		return nil, err
+	}
+	defer paramRows.Close()
+
+	for paramRows.Next() {
+		var procName string
+		var p core.ProcParameter
+		var paramName sql.NullString
+		if err := paramRows.Scan(&procName, &paramName, &p.DataType, &p.Mode); err != nil {
+			return nil, err
+		}
+		if !paramName.Valid || paramName.String == "" {
 			continue
 		}
-
-		var params []core.ProcParameter
-		for paramRows.Next() {
-			var p core.ProcParameter
-			var paramName sql.NullString
-			if err := paramRows.Scan(&paramName, &p.DataType, &p.Mode); err == nil {
-				p.Name = paramName.String
-				params = append(params, p)
-			}
+		p.Name = paramName.String
+		if proc, ok := procMap[procName]; ok {
+			proc.Parameters = append(proc.Parameters, p)
 		}
-		paramRows.Close()
+	}
+	if err := paramRows.Err(); err != nil {
+		return nil, err
+	}
 
-		procs = append(procs, core.StoredProcedure{Name: spName, Parameters: params})
+	procs := make([]core.StoredProcedure, 0, len(spNames))
+	for _, name := range spNames {
+		if proc, ok := procMap[name]; ok {
+			procs = append(procs, *proc)
+		}
 	}
 
 	return procs, nil
@@ -606,38 +598,7 @@ func (m *MSSQLAdapter) ExecuteProcedure(ctx context.Context, name string, params
 	}
 	defer rows.Close()
 
-	columns, err := rows.Columns()
-	if err != nil {
-		return nil, err
-	}
-
-	count := len(columns)
-	values := make([]interface{}, count)
-	valuePtrs := make([]interface{}, count)
-	var finalRows []map[string]any
-
-	for rows.Next() {
-		for i := range columns {
-			valuePtrs[i] = &values[i]
-		}
-		if err := rows.Scan(valuePtrs...); err != nil {
-			return nil, err
-		}
-		rowMap := make(map[string]any)
-		for i, col := range columns {
-			val := values[i]
-			if b, ok := val.([]byte); ok {
-				val = string(b)
-			}
-			if m.normalizeTurkish {
-				val = turkish.FixResultValue(val)
-			}
-			rowMap[col] = val
-		}
-		finalRows = append(finalRows, rowMap)
-	}
-
-	return &core.QueryResult{Columns: columns, Rows: finalRows}, nil
+	return m.parseRows(rows)
 }
 
 // executeQueryReadUncommitted runs the query inside a READ UNCOMMITTED transaction.// This is equivalent to appending WITH (NOLOCK) to every table reference.
@@ -656,6 +617,10 @@ func (m *MSSQLAdapter) executeQueryReadUncommitted(ctx context.Context, query st
 	}
 	defer rows.Close()
 
+	return m.parseRows(rows)
+}
+
+func (m *MSSQLAdapter) parseRows(rows *sql.Rows) (*core.QueryResult, error) {
 	columns, err := rows.Columns()
 	if err != nil {
 		return nil, err
@@ -689,9 +654,9 @@ func (m *MSSQLAdapter) executeQueryReadUncommitted(ctx context.Context, query st
 		}
 		finalRows = append(finalRows, rowMap)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 
-	return &core.QueryResult{
-		Columns: columns,
-		Rows:    finalRows,
-	}, nil
+	return &core.QueryResult{Columns: columns, Rows: finalRows}, nil
 }

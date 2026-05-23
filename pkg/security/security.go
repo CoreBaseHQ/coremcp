@@ -14,13 +14,36 @@ import (
 type QueryValidator struct {
 	allowedKeywords []string
 	blockedKeywords []string
+	blockedRegex    []blockedPattern
+}
+
+type blockedPattern struct {
+	word string
+	re   *regexp.Regexp
+}
+
+var defaultBlockedKeywords = []string{
+	"INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE",
+	"CREATE", "GRANT", "REVOKE", "EXEC", "EXECUTE", "MERGE",
+	"REPLACE", "RENAME", "CALL", "LOAD", "COPY",
 }
 
 // NewQueryValidator creates a new query validator with custom allowed/blocked keywords.
 func NewQueryValidator(allowedKeywords, blockedKeywords []string) *QueryValidator {
+	allBlocked := make([]string, 0, len(defaultBlockedKeywords)+len(blockedKeywords))
+	allBlocked = append(allBlocked, defaultBlockedKeywords...)
+	allBlocked = append(allBlocked, blockedKeywords...)
+
+	compiled := make([]blockedPattern, 0, len(allBlocked))
+	for _, word := range allBlocked {
+		pattern := fmt.Sprintf(`(?i)\b%s\b`, regexp.QuoteMeta(word))
+		compiled = append(compiled, blockedPattern{word: word, re: regexp.MustCompile(pattern)})
+	}
+
 	return &QueryValidator{
 		allowedKeywords: allowedKeywords,
 		blockedKeywords: blockedKeywords,
+		blockedRegex:    compiled,
 	}
 }
 
@@ -73,22 +96,10 @@ func (qv *QueryValidator) validateWithRegex(query string) error {
 		return fmt.Errorf("only SELECT and WITH queries are allowed")
 	}
 
-	// Default blocked keywords (can be extended via config)
-	defaultBlocked := []string{
-		"INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE",
-		"CREATE", "GRANT", "REVOKE", "EXEC", "EXECUTE", "MERGE",
-		"REPLACE", "RENAME", "CALL", "LOAD", "COPY",
-	}
-
-	// Merge with custom blocked keywords
-	allBlocked := append(defaultBlocked, qv.blockedKeywords...)
-
-	for _, word := range allBlocked {
+	for _, blocked := range qv.blockedRegex {
 		// Check for whole word matches to avoid false positives
-		pattern := fmt.Sprintf(`(?i)\b%s\b`, regexp.QuoteMeta(word))
-		matched, _ := regexp.MatchString(pattern, query)
-		if matched {
-			return fmt.Errorf("blocked keyword detected: %s", word)
+		if blocked.re.MatchString(query) {
+			return fmt.Errorf("blocked keyword detected: %s", blocked.word)
 		}
 	}
 
@@ -277,7 +288,14 @@ func (qm *QueryModifier) AddRowLimit(query string) (string, error) {
 
 // limitRe matches a LIMIT clause with its numeric value, optionally followed by an OFFSET.
 // Used by addRowLimitSimple to safely replace only the row-count token.
-var limitRe = regexp.MustCompile(`(?i)\bLIMIT\s+(\d+)`)
+var (
+	limitRe           = regexp.MustCompile(`(?i)\bLIMIT\s+(\d+)`)
+	mssqlSelectRe     = regexp.MustCompile(`(?i)\bSELECT\s+(DISTINCT\s+)?`)
+	mssqlTopRe        = regexp.MustCompile(`(?i)\bSELECT\s+(DISTINCT\s+)?TOP\s+\d+\b`)
+	mssqlFetchRe      = regexp.MustCompile(`(?i)\bFETCH\s+NEXT\s+\d+\s+ROWS?\s+ONLY\b`)
+	mssqlTopValueRe   = regexp.MustCompile(`(?i)(\bTOP\s+)(\d+)\b`)
+	mssqlFetchValueRe = regexp.MustCompile(`(?i)(\bFETCH\s+NEXT\s+)(\d+)(\s+ROWS?\s+ONLY\b)`)
+)
 
 // addRowLimitSimple adds or overrides the LIMIT clause using simple string
 // manipulation. It is used as a fallback when the SQL parser cannot parse the
@@ -286,6 +304,7 @@ var limitRe = regexp.MustCompile(`(?i)\bLIMIT\s+(\d+)`)
 // OFFSET and any other clauses that follow the LIMIT value are preserved.
 func (qm *QueryModifier) addRowLimitSimple(query string) string {
 	q := strings.TrimSpace(query)
+	upper := strings.ToUpper(q)
 
 	if m := limitRe.FindStringSubmatchIndex(q); m != nil {
 		// m[2]:m[3] is the capture group holding the numeric value.
@@ -298,6 +317,70 @@ func (qm *QueryModifier) addRowLimitSimple(query string) string {
 		return q[:m[2]] + strconv.Itoa(qm.maxRowLimit) + q[m[3]:]
 	}
 
+	if looksLikeMSSQL(upper) {
+		return qm.addRowLimitMSSQL(q)
+	}
+
 	// No LIMIT found — append one.
 	return fmt.Sprintf("%s LIMIT %d", q, qm.maxRowLimit)
+}
+
+func looksLikeMSSQL(upperQuery string) bool {
+	if strings.Contains(upperQuery, "WITH (NOLOCK)") {
+		return true
+	}
+	if mssqlFetchRe.MatchString(upperQuery) {
+		return true
+	}
+	if strings.Contains(upperQuery, "TOP ") {
+		return true
+	}
+	if strings.Contains(upperQuery, "NVARCHAR") || strings.Contains(upperQuery, "GETDATE()") {
+		return true
+	}
+	if strings.Contains(upperQuery, "[") && strings.Contains(upperQuery, "]") {
+		return true
+	}
+	return false
+}
+
+func (qm *QueryModifier) addRowLimitMSSQL(query string) string {
+	if mssqlTopRe.MatchString(query) {
+		return mssqlTopValueRe.ReplaceAllStringFunc(query, func(match string) string {
+			parts := mssqlTopValueRe.FindStringSubmatch(match)
+			if len(parts) != 3 {
+				return match
+			}
+			existing, err := strconv.Atoi(parts[2])
+			if err != nil || existing <= qm.maxRowLimit {
+				return match
+			}
+			return fmt.Sprintf("%s%d", parts[1], qm.maxRowLimit)
+		})
+	}
+	if mssqlFetchRe.MatchString(query) {
+		return mssqlFetchValueRe.ReplaceAllStringFunc(query, func(match string) string {
+			parts := mssqlFetchValueRe.FindStringSubmatch(match)
+			if len(parts) != 4 {
+				return match
+			}
+			existing, err := strconv.Atoi(parts[2])
+			if err != nil || existing <= qm.maxRowLimit {
+				return match
+			}
+			return fmt.Sprintf("%s%d%s", parts[1], qm.maxRowLimit, parts[3])
+		})
+	}
+
+	loc := mssqlSelectRe.FindStringSubmatchIndex(query)
+	if loc == nil {
+		return query
+	}
+
+	insertAt := loc[1]
+	if len(loc) >= 4 && loc[2] != -1 {
+		insertAt = loc[3]
+	}
+
+	return query[:insertAt] + fmt.Sprintf("TOP %d ", qm.maxRowLimit) + query[insertAt:]
 }

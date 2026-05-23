@@ -122,6 +122,7 @@ type ConnectClient struct {
 	maxReconnect    int
 	agentID         string
 	hostname        string
+	commandTimeout  time.Duration
 	queryValidator  *security.QueryValidator
 	queryModifier   *security.QueryModifier
 }
@@ -143,6 +144,7 @@ func init() {
 	connectCmd.Flags().StringP("agent-id", "a", "", "Agent ID (REQUIRED - get from agent creation)")
 	connectCmd.Flags().IntP("max-reconnect", "r", 10, "Maximum reconnection attempts (0 for infinite)")
 	connectCmd.Flags().DurationP("reconnect-delay", "d", 5*time.Second, "Delay between reconnection attempts")
+	connectCmd.Flags().Duration("command-timeout", 30*time.Second, "Timeout for remote commands (SQL/schema)")
 
 	_ = connectCmd.MarkFlagRequired("server")
 	_ = connectCmd.MarkFlagRequired("token")
@@ -159,6 +161,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	agentID, _ := cmd.Flags().GetString("agent-id")
 	maxReconnect, _ := cmd.Flags().GetInt("max-reconnect")
 	reconnectDelay, _ := cmd.Flags().GetDuration("reconnect-delay")
+	commandTimeout, _ := cmd.Flags().GetDuration("command-timeout")
 
 	// Validate agent ID is provided
 	if agentID == "" {
@@ -168,7 +171,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	// Validate WebSocket URL
 	u, err := url.Parse(serverURL)
 	if err != nil {
-		return fmt.Errorf("invalid server URL: %v", err)
+		return fmt.Errorf("invalid server URL: %w", err)
 	}
 	if u.Scheme != "ws" && u.Scheme != "wss" {
 		return fmt.Errorf("invalid server URL: scheme must be ws or wss, got %s", u.Scheme)
@@ -202,6 +205,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 		maxReconnect:    maxReconnect,
 		agentID:         agentID,
 		hostname:        hostname,
+		commandTimeout:  commandTimeout,
 		queryValidator:  security.NewQueryValidator(nil, nil),
 		queryModifier:   security.NewQueryModifier(1000),
 	}
@@ -210,6 +214,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	fmt.Fprintf(os.Stderr, "[INFO] Server: %s\n", serverURL)
 	fmt.Fprintf(os.Stderr, "[INFO] Agent ID: %s\n", agentID)
 	fmt.Fprintf(os.Stderr, "[INFO] Hostname: %s\n", hostname)
+	fmt.Fprintf(os.Stderr, "[INFO] Command timeout: %s\n", commandTimeout)
 	fmt.Fprintf(os.Stderr, "\n")
 
 	// Start connection with retry logic
@@ -305,7 +310,7 @@ func (c *ConnectClient) connect() error {
 		if resp != nil {
 			return fmt.Errorf("WebSocket dial failed (HTTP %d): %v", resp.StatusCode, err)
 		}
-		return fmt.Errorf("WebSocket dial failed: %v", err)
+		return fmt.Errorf("WebSocket dial failed: %w", err)
 	}
 
 	c.mu.Lock()
@@ -322,21 +327,23 @@ func (c *ConnectClient) connect() error {
 
 	if err := c.sendMessage(MsgTypeAuth, authPayload); err != nil {
 		c.closeConnection()
-		return fmt.Errorf("authentication failed: %v", err)
+		return fmt.Errorf("authentication failed: %w", err)
 	}
 
 	return nil
 }
 
 func (c *ConnectClient) handleMessages() error {
-	// Start heartbeat goroutine
-	go c.heartbeatLoop()
+	connCtx, cancel := context.WithCancel(c.ctx)
+	defer cancel()
+	// Start heartbeat goroutine tied to this connection's lifetime.
+	go c.heartbeatLoop(connCtx)
 
 	// Read messages from server
 	for {
 		select {
-		case <-c.ctx.Done():
-			return c.ctx.Err()
+		case <-connCtx.Done():
+			return connCtx.Err()
 		default:
 		}
 
@@ -350,7 +357,7 @@ func (c *ConnectClient) handleMessages() error {
 
 		var msg WSMessage
 		if err := conn.ReadJSON(&msg); err != nil {
-			return fmt.Errorf("read message failed: %v", err)
+			return fmt.Errorf("read message failed: %w", err)
 		}
 
 		// Handle message asynchronously
@@ -524,11 +531,11 @@ func (c *ConnectClient) executeSQL(sourceName, query string, params map[string]i
 	c.mu.RUnlock()
 
 	if err := validator.ValidateQuery(query); err != nil {
-		return nil, fmt.Errorf("query validation failed: %v", err)
+		return nil, fmt.Errorf("query validation failed: %w", err)
 	}
 	modifiedQuery, err := modifier.AddRowLimit(query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to apply row limit: %v", err)
+		return nil, fmt.Errorf("failed to apply row limit: %w", err)
 	}
 	query = modifiedQuery
 
@@ -537,9 +544,16 @@ func (c *ConnectClient) executeSQL(sourceName, query string, params map[string]i
 		log.Printf("[DEBUG] Query parameters: %v", params)
 	}
 
+	execCtx := c.ctx
+	cancel := func() {}
+	if c.commandTimeout > 0 {
+		execCtx, cancel = context.WithTimeout(c.ctx, c.commandTimeout)
+	}
+	defer cancel()
+
 	// Execute query with parameters
 	startTime := time.Now()
-	result, err := src.ExecuteQuery(c.ctx, query, params)
+	result, err := src.ExecuteQuery(execCtx, query, params)
 	executionTime := time.Since(startTime)
 
 	if err != nil {
@@ -572,9 +586,16 @@ func (c *ConnectClient) getSchema(sourceName string) (interface{}, error) {
 
 	log.Printf("[INFO] Retrieving schema for source '%s'", sourceName)
 
+	getCtx := c.ctx
+	cancel := func() {}
+	if c.commandTimeout > 0 {
+		getCtx, cancel = context.WithTimeout(c.ctx, c.commandTimeout)
+	}
+	defer cancel()
+
 	// Get schema
 	startTime := time.Now()
-	schema, err := src.GetSchema(c.ctx)
+	schema, err := src.GetSchema(getCtx)
 	retrievalTime := time.Since(startTime)
 
 	if err != nil {
@@ -621,7 +642,7 @@ func (c *ConnectClient) listSources() map[string]interface{} {
 func (c *ConnectClient) sendMessage(msgType MessageType, payload interface{}) error {
 	payloadJSON, err := json.Marshal(payload)
 	if err != nil {
-		return fmt.Errorf("failed to marshal payload: %v", err)
+		return fmt.Errorf("failed to marshal payload: %w", err)
 	}
 
 	msg := WSMessage{
@@ -663,7 +684,7 @@ func (c *ConnectClient) sendError(commandID, errMsg string) error {
 	return c.sendMessage(MsgTypeError, payload)
 }
 
-func (c *ConnectClient) heartbeatLoop() {
+func (c *ConnectClient) heartbeatLoop(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
@@ -681,7 +702,7 @@ func (c *ConnectClient) heartbeatLoop() {
 				log.Printf("[WARN] Heartbeat failed: %v", err)
 				return
 			}
-		case <-c.ctx.Done():
+		case <-ctx.Done():
 			return
 		}
 	}
