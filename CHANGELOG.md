@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.7] - 2026-05-23
+
+### Changed
+- **CoreMCP CLI:** Refactored command lifecycle to use `RunE` instead of `log.Fatal` to allow deferred cleanup execution.
+- **Source Initialization:** Replaced arbitrary `time.Sleep` with a robust `sync.WaitGroup` to ensure schemas finish loading before starting the MCP server.
+- **Optimization:** Generic SQL `QueryValidator` regex patterns are now pre-compiled once at startup, preventing runaway CPU/OOM spikes on high throughput constraints.
+
+### Fixed
+- **MSSQL N+1 Schema Queries:** Drastically improved startup performance by moving from iterative row queries to bulk `INFORMATION_SCHEMA` queries stitched via in-memory maps in `GetSchema`, `GetViews`, and `GetProcedures`.
+- **MSSQL View Resolution:** Fixed a bug where view names dropped their parent schema context across identically named views in different schemas.
+- **Strict MSSQL Row Limiting:** Added dialect awareness for `TOP` and `FETCH NEXT` to gracefully cap rows without generating broken MySQL-style `LIMIT 1000` queries on MSSQL servers.
+- **Cursor Safety:** Enforced strict `rows.Err()` checks across all database iteration loops to catch fatal cursor errors.
+- **Deadlock Prevention:** Added `context.WithTimeout` logic attached to a new `--command-timeout` flag enforcing query execution deadlines.
+- **Error Wrapping:** Modernized error propagations with Go's standard `%w` format for unwrapability.
+
 ## [0.4.6] - 2026-05-02
 
 ### Added
@@ -246,7 +261,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Basic license (Apache 2.0) and gitignore files.
 - Core package interfaces and types.
 
-[Unreleased]: https://github.com/corebasehq/coremcp/compare/v0.4.4...HEAD
+[Unreleased]: https://github.com/corebasehq/coremcp/compare/v0.4.7...HEAD
+[0.4.7]: https://github.com/corebasehq/coremcp/compare/v0.4.6...v0.4.7
+[0.4.6]: https://github.com/corebasehq/coremcp/compare/v0.4.5...v0.4.6
+[0.4.5]: https://github.com/corebasehq/coremcp/compare/v0.4.4...v0.4.5
 [0.4.4]: https://github.com/corebasehq/coremcp/compare/v0.4.3...v0.4.4
 [0.4.3]: https://github.com/corebasehq/coremcp/compare/v0.4.2...v0.4.3
 [0.4.2]: https://github.com/corebasehq/coremcp/compare/v0.4.1...v0.4.2
