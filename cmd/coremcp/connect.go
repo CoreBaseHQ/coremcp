@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
+	mrand "math/rand/v2"
 	"net/url"
 	"os"
 	"os/signal"
@@ -18,6 +20,11 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/spf13/cobra"
 )
+
+// maxConcurrentCommands caps the number of in-flight command handlers per
+// connection. Without a cap, a misbehaving (or malicious) server could push
+// commands faster than the agent can process them and exhaust memory.
+const maxConcurrentCommands = 32
 
 // MessageType represents the type of WebSocket message
 type MessageType string
@@ -113,7 +120,9 @@ type ConnectClient struct {
 	token           string
 	conn            *websocket.Conn
 	mu              sync.RWMutex
-	writeMu         sync.Mutex // Protects WebSocket writes
+	writeMu         sync.Mutex    // Protects WebSocket writes
+	syncMu          sync.Mutex    // Serialises handleConfigSync invocations
+	cmdSem          chan struct{} // Bounds concurrent command handlers
 	sources         map[string]core.Source
 	semanticContext map[string]SemanticSourceContext
 	ctx             context.Context
@@ -197,6 +206,7 @@ func runConnect(cmd *cobra.Command, args []string) error {
 	client := &ConnectClient{
 		serverURL:       serverURL,
 		token:           token,
+		cmdSem:          make(chan struct{}, maxConcurrentCommands),
 		sources:         make(map[string]core.Source),
 		semanticContext: make(map[string]SemanticSourceContext),
 		ctx:             ctx,
@@ -262,8 +272,9 @@ func (c *ConnectClient) connectWithRetry() error {
 					break
 				}
 			}
-			// Add jitter (±10%)
-			jitter := time.Duration(float64(delay) * 0.1 * (2*float64(time.Now().UnixNano()%100)/100.0 - 1))
+			// Add ±10% jitter to avoid thundering-herd reconnects when many
+			// agents lose the same upstream simultaneously.
+			jitter := time.Duration(float64(delay) * (mrand.Float64()*0.2 - 0.1))
 			delay += jitter
 
 			log.Printf("[INFO] Reconnection attempt %d/%d in %v...", attempt, c.maxReconnect, delay)
@@ -360,8 +371,18 @@ func (c *ConnectClient) handleMessages() error {
 			return fmt.Errorf("read message failed: %w", err)
 		}
 
-		// Handle message asynchronously
-		go c.handleMessage(&msg)
+		// Bound concurrent command handlers so a fast-pushing server cannot
+		// spawn unbounded goroutines.
+		select {
+		case c.cmdSem <- struct{}{}:
+		case <-connCtx.Done():
+			return connCtx.Err()
+		}
+		msgCopy := msg
+		go func() {
+			defer func() { <-c.cmdSem }()
+			c.handleMessage(&msgCopy)
+		}()
 	}
 }
 
@@ -456,6 +477,11 @@ func (c *ConnectClient) handleCommand(msg *WSMessage) {
 }
 
 func (c *ConnectClient) handleConfigSync(msg *WSMessage) {
+	// Serialise concurrent syncs so two messages can't interleave their
+	// teardown/setup phases against c.sources.
+	c.syncMu.Lock()
+	defer c.syncMu.Unlock()
+
 	var configPayload ConfigSyncPayload
 	if err := json.Unmarshal(msg.Payload, &configPayload); err != nil {
 		log.Printf("[ERROR] Failed to parse config sync payload: %v", err)
@@ -464,26 +490,27 @@ func (c *ConnectClient) handleConfigSync(msg *WSMessage) {
 
 	log.Printf("[INFO] Syncing configuration: %d source(s)", len(configPayload.Sources))
 
-	// Update security components from remote config.
+	// Snapshot+detach the old source set, swap in the new security components
+	// and semantic context, then release the lock before doing any I/O.
 	c.mu.Lock()
+	oldSources := c.sources
+	c.sources = make(map[string]core.Source)
 	c.queryValidator = security.NewQueryValidator(configPayload.Security.AllowedKeywords, configPayload.Security.BlockedKeywords)
 	c.queryModifier = security.NewQueryModifier(configPayload.Security.MaxRowLimit)
-	c.mu.Unlock()
-
-	// Close existing sources and reset semantic context to match new config.
-	c.mu.Lock()
-	for name, src := range c.sources {
-		if err := src.Close(c.ctx); err != nil {
-			log.Printf("[WARN] Failed to close source %s: %v", name, err)
-		}
-		delete(c.sources, name)
-	}
 	if configPayload.SemanticContext != nil {
 		c.semanticContext = configPayload.SemanticContext
 	} else {
 		c.semanticContext = make(map[string]SemanticSourceContext)
 	}
 	c.mu.Unlock()
+
+	// Close detached sources without holding c.mu — a slow Close must not
+	// block executeSQL / getSchema readers.
+	for name, src := range oldSources {
+		if err := src.Close(c.ctx); err != nil {
+			log.Printf("[WARN] Failed to close source %s: %v", name, err)
+		}
+	}
 
 	semanticCount := 0
 	for _, sc := range configPayload.SemanticContext {
@@ -492,7 +519,8 @@ func (c *ConnectClient) handleConfigSync(msg *WSMessage) {
 	log.Printf("[INFO] Semantic context: %d source(s), %d annotation/glossary entries",
 		len(configPayload.SemanticContext), semanticCount)
 
-	// Create new sources from remote config
+	// Dial new sources without holding c.mu (Connect can block on network I/O).
+	newSources := make(map[string]core.Source, len(configPayload.Sources))
 	for _, remoteSrc := range configPayload.Sources {
 		src, err := adapter.NewSource(remoteSrc.Type, remoteSrc.DSN, remoteSrc.NoLock, remoteSrc.NormalizeTurkish)
 		if err != nil {
@@ -505,12 +533,14 @@ func (c *ConnectClient) handleConfigSync(msg *WSMessage) {
 			continue
 		}
 
-		c.mu.Lock()
-		c.sources[remoteSrc.Name] = src
-		c.mu.Unlock()
-
+		newSources[remoteSrc.Name] = src
 		log.Printf("[INFO] Source synced: %s (%s) [ReadOnly: %v]", remoteSrc.Name, remoteSrc.Type, remoteSrc.ReadOnly)
 	}
+
+	// Publish the new source set in one swap.
+	c.mu.Lock()
+	c.sources = newSources
+	c.mu.Unlock()
 
 	log.Println("[INFO] Configuration sync completed!")
 }
@@ -544,6 +574,14 @@ func (c *ConnectClient) executeSQL(sourceName, query string, params map[string]i
 		log.Printf("[DEBUG] Query parameters: %v", params)
 	}
 
+	// Bind params as named SQL arguments. Adapters that don't honour bind
+	// parameters (REST/GraphQL/dummy) simply ignore the extra args; MSSQL
+	// forwards them to database/sql, which accepts sql.NamedArg.
+	args := make([]any, 0, len(params))
+	for k, v := range params {
+		args = append(args, sql.Named(k, v))
+	}
+
 	execCtx := c.ctx
 	cancel := func() {}
 	if c.commandTimeout > 0 {
@@ -551,9 +589,8 @@ func (c *ConnectClient) executeSQL(sourceName, query string, params map[string]i
 	}
 	defer cancel()
 
-	// Execute query with parameters
 	startTime := time.Now()
-	result, err := src.ExecuteQuery(execCtx, query, params)
+	result, err := src.ExecuteQuery(execCtx, query, args...)
 	executionTime := time.Since(startTime)
 
 	if err != nil {

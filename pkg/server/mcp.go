@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/corebasehq/coremcp/pkg/core"
 	"github.com/corebasehq/coremcp/pkg/security"
@@ -83,14 +84,20 @@ func validateAndCoerceParam(value, paramType string) (string, error) {
 
 // MCPServer represents the MCP server instance that handles database queries.
 type MCPServer struct {
-	mcpServer      *server.MCPServer
-	sources        map[string]sourceEntry
-	schemaContext  string                        // Pre-built schema context for AI
-	customTools    map[string]customToolEntry    // Custom tools from config
-	tableSchemas   map[string][]core.TableSchema // Cached table schemas per source
-	queryValidator *security.QueryValidator      // SQL query validator
-	piiMasker      *security.PIIMasker           // PII data masker
-	queryModifier  *security.QueryModifier       // Query modifier for row limits
+	mcpServer   *server.MCPServer
+	sources     map[string]sourceEntry
+	customTools map[string]customToolEntry // Custom tools from config
+
+	// schemaMu guards schemaContext and tableSchemas. LoadSchemas runs in a
+	// background goroutine while request handlers may read these fields, so
+	// access must be synchronised.
+	schemaMu      sync.RWMutex
+	schemaContext string                        // Pre-built schema context for AI
+	tableSchemas  map[string][]core.TableSchema // Cached table schemas per source
+
+	queryValidator *security.QueryValidator // SQL query validator
+	piiMasker      *security.PIIMasker      // PII data masker
+	queryModifier  *security.QueryModifier  // Query modifier for row limits
 }
 
 type customToolEntry struct {
@@ -216,6 +223,10 @@ func (ms *MCPServer) LoadSchemas(ctx context.Context) error {
 	contextBuilder.WriteString("=== DATABASE SCHEMA CONTEXT ===\n\n")
 	contextBuilder.WriteString("You have access to the following database sources and their schemas:\n\n")
 
+	// Build schemas into a local map first; swap into ms.tableSchemas under the
+	// lock at the end so handlers never see a partially populated cache.
+	loaded := make(map[string][]core.TableSchema, len(ms.sources))
+
 	for name, entry := range ms.sources {
 		contextBuilder.WriteString(fmt.Sprintf("## Source: %s (%s)\n", name, entry.source.Name()))
 		if entry.readOnly {
@@ -229,8 +240,7 @@ func (ms *MCPServer) LoadSchemas(ctx context.Context) error {
 			continue
 		}
 
-		// Cache schemas for use by describe_table without re-querying
-		ms.tableSchemas[name] = schemas
+		loaded[name] = schemas
 
 		if len(schemas) == 0 {
 			contextBuilder.WriteString("No tables found.\n\n")
@@ -325,12 +335,17 @@ func (ms *MCPServer) LoadSchemas(ctx context.Context) error {
 	contextBuilder.WriteString("Use the 'list_views' tool to list views and 'list_procedures' to list stored procedures.\n")
 	contextBuilder.WriteString("Use the 'execute_procedure' tool to run a stored procedure (non-read-only sources only).\n")
 
+	ms.schemaMu.Lock()
 	ms.schemaContext = contextBuilder.String()
+	ms.tableSchemas = loaded
+	ms.schemaMu.Unlock()
 	return nil
 }
 
 // GetSchemaContext returns the pre-built schema context for use in AI prompts.
 func (ms *MCPServer) GetSchemaContext() string {
+	ms.schemaMu.RLock()
+	defer ms.schemaMu.RUnlock()
 	return ms.schemaContext
 }
 
@@ -539,7 +554,9 @@ func (ms *MCPServer) handleDescribeTable(ctx context.Context, request mcp.CallTo
 	}
 
 	// Use cached schemas when available to avoid reloading all tables on every call.
+	ms.schemaMu.RLock()
 	schemas, cached := ms.tableSchemas[sourceName]
+	ms.schemaMu.RUnlock()
 	if !cached {
 		var err error
 		schemas, err = entry.source.GetSchema(ctx)
@@ -742,7 +759,10 @@ func (ms *MCPServer) handleExecuteProcedure(ctx context.Context, request mcp.Cal
 }
 
 func (ms *MCPServer) handleSchemaPrompt(ctx context.Context, request mcp.GetPromptRequest) (*mcp.GetPromptResult, error) {
-	if ms.schemaContext == "" {
+	ms.schemaMu.RLock()
+	schemaContext := ms.schemaContext
+	ms.schemaMu.RUnlock()
+	if schemaContext == "" {
 		return &mcp.GetPromptResult{
 			Messages: []mcp.PromptMessage{
 				{
@@ -763,7 +783,7 @@ func (ms *MCPServer) handleSchemaPrompt(ctx context.Context, request mcp.GetProm
 				Role: mcp.RoleUser,
 				Content: mcp.TextContent{
 					Type: "text",
-					Text: ms.schemaContext,
+					Text: schemaContext,
 				},
 			},
 		},

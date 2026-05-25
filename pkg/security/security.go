@@ -244,6 +244,15 @@ func NewQueryModifier(maxRowLimit int) *QueryModifier {
 
 // AddRowLimit adds a LIMIT clause to a query if it doesn't already have one.
 func (qm *QueryModifier) AddRowLimit(query string) (string, error) {
+	// xwb1989/sqlparser is MySQL-dialect; round-tripping a T-SQL query through
+	// sqlparser.String can mangle MSSQL-specific syntax (brackets, NOLOCK hints,
+	// N'...' literals, OUTPUT clauses). When the query looks like T-SQL, skip the
+	// AST path entirely and use the regex-based rewriter, which only edits the
+	// LIMIT/TOP/FETCH numeric tokens and leaves everything else intact.
+	if looksLikeMSSQL(strings.ToUpper(query)) {
+		return qm.addRowLimitSimple(query), nil
+	}
+
 	// Parse the query
 	stmt, err := sqlparser.Parse(query)
 	if err != nil {
@@ -278,8 +287,11 @@ func (qm *QueryModifier) AddRowLimit(query string) (string, error) {
 		return sqlparser.String(s), nil
 
 	case *sqlparser.Union:
-		// Union queries - add limit at the end
-		return query + fmt.Sprintf(" LIMIT %d", qm.maxRowLimit), nil
+		// Appending "LIMIT N" directly to a UNION would only cap the trailing
+		// SELECT after the MSSQL adapter rewrites LIMIT→TOP. Wrap the whole
+		// UNION in a subquery so the cap applies to the combined result set
+		// regardless of dialect.
+		return fmt.Sprintf("SELECT * FROM (%s) AS _capped LIMIT %d", query, qm.maxRowLimit), nil
 
 	default:
 		return query, nil
@@ -325,6 +337,11 @@ func (qm *QueryModifier) addRowLimitSimple(query string) string {
 	return fmt.Sprintf("%s LIMIT %d", q, qm.maxRowLimit)
 }
 
+// looksLikeMSSQL is a best-effort heuristic that flags queries containing
+// T-SQL-specific syntax (NOLOCK hint, TOP/FETCH NEXT, bracketed identifiers,
+// or common MSSQL types/functions). False positives are harmless because they
+// only steer the row-cap rewriter toward the regex-based path that preserves
+// the original query verbatim.
 func looksLikeMSSQL(upperQuery string) bool {
 	if strings.Contains(upperQuery, "WITH (NOLOCK)") {
 		return true

@@ -69,7 +69,7 @@ var serveCmd = &cobra.Command{
 		}()
 
 		for _, sourceCfg := range cfg.Sources {
-			src, err := adapter.NewSource(sourceCfg.Type, sourceCfg.DSN, sourceCfg.NoLock, sourceCfg.NormalizeTurkish)
+			src, err := adapter.NewSource(sourceCfg.Type, sourceCfg.BuildDSN(), sourceCfg.NoLock, sourceCfg.NormalizeTurkish)
 			if err != nil {
 				log.Printf("ERROR: Failed to create source %s: %v\n", sourceCfg.Name, err)
 				continue

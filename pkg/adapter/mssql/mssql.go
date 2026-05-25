@@ -124,7 +124,10 @@ func (m *MSSQLAdapter) Connect(ctx context.Context) error {
 	return nil
 }
 
-func (m *MSSQLAdapter) Close(ctx context.Context) error {
+// Close closes the underlying *sql.DB. The ctx parameter is accepted to satisfy
+// the core.Source interface but is not honoured: database/sql's Close is a
+// bounded, in-process operation and does not accept a context.
+func (m *MSSQLAdapter) Close(_ context.Context) error {
 	if m.db != nil {
 		return m.db.Close()
 	}
