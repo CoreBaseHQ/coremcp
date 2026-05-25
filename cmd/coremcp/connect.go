@@ -273,8 +273,9 @@ func (c *ConnectClient) connectWithRetry() error {
 				}
 			}
 			// Add ±10% jitter to avoid thundering-herd reconnects when many
-			// agents lose the same upstream simultaneously.
-			jitter := time.Duration(float64(delay) * (mrand.Float64()*0.2 - 0.1))
+			// agents lose the same upstream simultaneously. Non-cryptographic
+			// randomness is sufficient — jitter is purely a load-spreading hint.
+			jitter := time.Duration(float64(delay) * (mrand.Float64()*0.2 - 0.1)) //nolint:gosec // G404: jitter is not security-sensitive
 			delay += jitter
 
 			log.Printf("[INFO] Reconnection attempt %d/%d in %v...", attempt, c.maxReconnect, delay)

@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.8] - 2026-05-26
+
+### Fixed
+- **REST/GraphQL sources configured via `base_url`:** `serve` now calls `SourceConfig.BuildDSN()` instead of passing the raw `dsn` field, so REST and GraphQL sources configured per the documented schema (`base_url` + `api_key` + `headers`) actually connect. Previously the adapter received an empty DSN.
+- **`connect` SQL parameter binding:** `executeSQL` now converts the protocol's `params` map to `sql.NamedArg` before invoking `ExecuteQuery`. Previously the raw `map[string]interface{}` was forwarded to `database/sql`, which rejected it at runtime for any `run_sql` command carrying non-empty params.
+- **Schema cache data race:** `MCPServer.schemaContext` and `MCPServer.tableSchemas` are now guarded by an `sync.RWMutex`. `LoadSchemas` builds into a local map and swaps it in atomically, so `describe_table` and the `database_schema` prompt can no longer observe a partially populated cache while the background schema load is in flight.
+- **`config_sync` lock interleaving (`connect` mode):** `handleConfigSync` now serialises through a dedicated `syncMu`, snapshots the live source set, and closes detached sources after releasing `c.mu`. Concurrent sync messages can no longer interleave teardown/setup phases, and a slow `Close` no longer blocks `executeSQL`/`getSchema` readers.
+- **UNION row cap:** `QueryModifier.AddRowLimit` now wraps `UNION` queries in a `SELECT * FROM (…) AS _capped LIMIT N` subquery so the row cap applies to the combined result set. Previously the limit affected only the trailing `SELECT` after the MSSQL `LIMIT`→`TOP` rewrite.
+- **T-SQL passthrough:** `AddRowLimit` now detects MSSQL-shaped queries up-front and skips the `xwb1989/sqlparser` AST path entirely, preventing brackets, `WITH (NOLOCK)` hints, and `N'…'` literals from being mangled when re-emitted as MySQL syntax.
+
+### Changed
+- **`connect` mode goroutine cap:** In-flight command handlers are now bounded by a per-connection semaphore (32) so a fast-pushing or misbehaving server cannot exhaust memory by spawning unbounded goroutines.
+- **Reconnect jitter:** Replaced the `time.Now().UnixNano()%100` jitter source with `math/rand/v2`, giving uncorrelated ±10% spread when many agents reconnect simultaneously.
+- **MSSQL `Close`:** Documented that the context parameter is accepted only to satisfy `core.Source`; `database/sql`'s `Close` is bounded and does not accept a context.
+- **Server version auto-detected:** `server.version` no longer needs to be hand-edited in `coremcp.yaml`. When omitted, the MCP server advertises the binary version compiled in via `-ldflags` (the same string shown by `coremcp version`). Setting `server.version` explicitly still overrides the default for users who need a custom advertised version.
+
 ## [0.4.7] - 2026-05-23
 
 ### Changed
@@ -261,7 +277,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Basic license (Apache 2.0) and gitignore files.
 - Core package interfaces and types.
 
-[Unreleased]: https://github.com/corebasehq/coremcp/compare/v0.4.7...HEAD
+[Unreleased]: https://github.com/corebasehq/coremcp/compare/v0.4.8...HEAD
+[0.4.8]: https://github.com/corebasehq/coremcp/compare/v0.4.7...v0.4.8
 [0.4.7]: https://github.com/corebasehq/coremcp/compare/v0.4.6...v0.4.7
 [0.4.6]: https://github.com/corebasehq/coremcp/compare/v0.4.5...v0.4.6
 [0.4.5]: https://github.com/corebasehq/coremcp/compare/v0.4.4...v0.4.5

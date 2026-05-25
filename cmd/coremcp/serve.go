@@ -28,7 +28,14 @@ var serveCmd = &cobra.Command{
 
 		fmt.Fprintf(os.Stderr, "Starting CoreMCP Server via %s...\n", cfg.Server.Transport)
 
-		mcpSrv := server.NewMCPServer(cfg.Server.Name, cfg.Server.Version)
+		// Default to the version compiled in via -ldflags (cmd/coremcp/version.go).
+		// Yaml-supplied server.version is still honoured if explicitly set, but
+		// users no longer have to bump it by hand on every release.
+		serverVersion := cfg.Server.Version
+		if serverVersion == "" {
+			serverVersion = Version
+		}
+		mcpSrv := server.NewMCPServer(cfg.Server.Name, serverVersion)
 
 		// Configure security features
 		log.Println("Configuring security features...")

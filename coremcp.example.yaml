@@ -3,7 +3,9 @@
 
 server:
   name: "coremcp-agent"
-  version: "0.4.6"
+  # version: optional. Defaults to the binary version compiled in via -ldflags
+  # (shown by `coremcp version`). Override only if you need to advertise a
+  # different version string to MCP clients.
   transport: "stdio"  # stdio (for Claude Desktop) or http (for remote server)
   port: 8080          # Only used in http mode
 
