@@ -6,104 +6,234 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-
-	"github.com/xwb1989/sqlparser"
 )
 
 // QueryValidator validates SQL queries for security purposes.
+//
+// Design note — why we do not use a third-party SQL parser:
+//
+// Previously this package used xwb1989/sqlparser (MySQL dialect, unmaintained
+// since 2018) with a regex denylist fallback. The fallback was bypassable via
+// comment/whitespace tricks (e.g. "SELECT 1; EX/**/EC xp_cmdshell …" — the
+// regex would not match "EX/**/EC" but SQL Server treats /**/ as whitespace
+// and executes the statement). Switching to vitess or cockroachdb parsers
+// only moves the problem: every dialect-aware parser has corner cases where
+// it cannot parse a legitimate target-DB query, and any "fall through to
+// regex" relaxation re-introduces the same bypass class.
+//
+// We do not actually need an AST. The security goal is to classify the
+// statement type (SELECT/WITH allowed, everything else rejected) and to
+// reject multi-statement payloads. Both checks are reliable on a properly
+// stripped query (no comments, no string literals). This file does that with
+// a small custom tokeniser — easier to audit and free of parser-dialect
+// gotchas.
+//
+// The allowedKeywords / blockedKeywords slices are retained on the struct
+// for API + config-payload backwards compatibility (the cloud control plane
+// and existing coremcp.yaml files still reference them) but they are no
+// longer consulted by the validator.
 type QueryValidator struct {
-	allowedKeywords []string
-	blockedKeywords []string
-	blockedRegex    []blockedPattern
+	allowedKeywords []string //nolint:unused // retained for API compatibility; see type doc
+	blockedKeywords []string //nolint:unused // retained for API compatibility; see type doc
 }
 
-type blockedPattern struct {
-	word string
-	re   *regexp.Regexp
-}
-
-var defaultBlockedKeywords = []string{
-	"INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "TRUNCATE",
-	"CREATE", "GRANT", "REVOKE", "EXEC", "EXECUTE", "MERGE",
-	"REPLACE", "RENAME", "CALL", "LOAD", "COPY",
-}
-
-// NewQueryValidator creates a new query validator with custom allowed/blocked keywords.
+// NewQueryValidator creates a new query validator.
+//
+// The allowedKeywords / blockedKeywords parameters are accepted but ignored —
+// see the QueryValidator type doc for why. The signature is preserved so the
+// MCP server and the WebSocket config_sync code path do not have to change.
 func NewQueryValidator(allowedKeywords, blockedKeywords []string) *QueryValidator {
-	allBlocked := make([]string, 0, len(defaultBlockedKeywords)+len(blockedKeywords))
-	allBlocked = append(allBlocked, defaultBlockedKeywords...)
-	allBlocked = append(allBlocked, blockedKeywords...)
-
-	compiled := make([]blockedPattern, 0, len(allBlocked))
-	for _, word := range allBlocked {
-		pattern := fmt.Sprintf(`(?i)\b%s\b`, regexp.QuoteMeta(word))
-		compiled = append(compiled, blockedPattern{word: word, re: regexp.MustCompile(pattern)})
-	}
-
 	return &QueryValidator{
 		allowedKeywords: allowedKeywords,
 		blockedKeywords: blockedKeywords,
-		blockedRegex:    compiled,
 	}
 }
 
-// ValidateQuery validates if a SQL query is safe to execute.
-// Uses sqlparser for AST-based analysis to detect dangerous operations.
+// forbiddenInBodyRe matches tokens that must never appear in the body of a
+// SELECT or WITH statement, even when the leading-keyword classifier has
+// accepted the shape. Each of these turns a SELECT-shaped statement into a
+// write or exfiltration vector:
+//
+//   - INTO            "SELECT … INTO new_table FROM …" creates a table (MSSQL,
+//                     PostgreSQL); "SELECT … INTO OUTFILE/DUMPFILE …" writes
+//                     to the server filesystem (MySQL); "SELECT … INTO @var"
+//                     mutates T-SQL session state.
+//   - OPENROWSET      T-SQL ad-hoc distributed query — can pull data from any
+//                     remote endpoint reachable from the DB server. Classic
+//                     exfiltration vector.
+//   - OPENQUERY       T-SQL distributed query against a linked server.
+//   - OPENDATASOURCE  T-SQL ad-hoc linked-server connection.
+//
+// The scan runs on a copy of the query with comments and string literals
+// already stripped, so single-quoted decoys and "EX/**/EC" tricks cannot
+// hide the token. The only residual false-positive surface is a column or
+// table whose unquoted name exactly matches one of these reserved-ish
+// words — extremely rare in real schemas, and the error message is explicit
+// so the user can rename or escape.
+var forbiddenInBodyRe = regexp.MustCompile(`(?i)\b(INTO|OPENROWSET|OPENQUERY|OPENDATASOURCE)\b`)
+
+// ValidateQuery decides whether a SQL query is safe to forward to a source.
+//
+// Posture: fail-closed. Four layers:
+//  1. Reject multi-statement payloads — any ';' outside strings/comments,
+//     other than a single trailing one, is fatal. This catches stacked-query
+//     attacks regardless of dialect.
+//  2. Classify the leading statement keyword (SELECT / WITH allowed; every
+//     other recognised keyword is rejected with a specific error; unknown
+//     leading tokens are rejected generically).
+//  3. The leading keyword is read from the query AFTER stripping comments
+//     and string literals, so payloads like "/* SELECT */ DROP TABLE x"
+//     or "SELECT 'safe'; DELETE FROM users" cannot lie about their shape.
+//  4. For SELECT/WITH bodies, scan the stripped text for write/exfiltration
+//     tokens that cannot legitimately appear in a read-only query
+//     (SELECT…INTO, OPENROWSET, OPENQUERY, OPENDATASOURCE).
+//
+// This validator does NOT introspect CTE bodies for DML keywords. For
+// PostgreSQL, a CTE may legally contain "DELETE … RETURNING" — the line of
+// defence there is the DB user's permission set (the README requires a
+// SELECT-only user, and the cloud-direct adapter additionally pins the
+// session to default_transaction_read_only). MSSQL CTEs are SELECT-only at
+// the grammar level, so the primary target is not affected.
 func (qv *QueryValidator) ValidateQuery(query string) error {
-	// First, try to parse the query with sqlparser
-	stmt, err := sqlparser.Parse(query)
-	if err != nil {
-		// If parsing fails, fall back to regex-based validation
-		return qv.validateWithRegex(query)
+	if hasMultipleStatements(query) {
+		return fmt.Errorf("multi-statement queries are not allowed")
 	}
 
-	// Check statement type
-	switch s := stmt.(type) {
-	case *sqlparser.Select:
-		// SELECT is allowed
-		return qv.validateSelectStatement(s)
-	case *sqlparser.Union:
-		// UNION is allowed (it's just multiple SELECTs)
-		return nil
-	case *sqlparser.Insert, *sqlparser.Update, *sqlparser.Delete:
-		return fmt.Errorf("write operations (INSERT/UPDATE/DELETE) are not allowed")
-	case *sqlparser.DDL:
-		return fmt.Errorf("DDL operations (CREATE/ALTER/DROP/TRUNCATE) are not allowed")
-	case *sqlparser.OtherAdmin:
-		return fmt.Errorf("administrative operations are not allowed")
-	default:
-		return fmt.Errorf("unsupported query type: %T", stmt)
-	}
-}
-
-// validateSelectStatement performs deeper validation on SELECT statements.
-func (qv *QueryValidator) validateSelectStatement(_ *sqlparser.Select) error {
-	// Check for subqueries that might contain dangerous operations
-	// This is a simplified check - sqlparser already ensures SELECT-only in subqueries
-
-	// Additional custom validations can be added here
-	// For example, checking for specific function calls, etc.
-
-	return nil
-}
-
-// validateWithRegex performs regex-based validation as a fallback.
-func (qv *QueryValidator) validateWithRegex(query string) error {
-	q := strings.TrimSpace(strings.ToUpper(query))
-
-	// Allow only SELECT and WITH (CTE) statements
-	if !strings.HasPrefix(q, "SELECT") && !strings.HasPrefix(q, "WITH") {
-		return fmt.Errorf("only SELECT and WITH queries are allowed")
+	kw := firstKeyword(query)
+	if kw == "" {
+		return fmt.Errorf("query rejected: no SQL statement found")
 	}
 
-	for _, blocked := range qv.blockedRegex {
-		// Check for whole word matches to avoid false positives
-		if blocked.re.MatchString(query) {
-			return fmt.Errorf("blocked keyword detected: %s", blocked.word)
+	switch kw {
+	case "SELECT", "WITH":
+		// Statement shape is OK — but scan the body for write/exfil tokens
+		// that turn a SELECT-shaped statement into something dangerous.
+		if m := forbiddenInBodyRe.FindString(stripCommentsAndStrings(query)); m != "" {
+			return fmt.Errorf("query rejected: forbidden token %q in SELECT/WITH body (SELECT...INTO, OPENROWSET-family and similar are not allowed)", strings.ToUpper(m))
 		}
+		return nil
+	case "INSERT", "UPDATE", "DELETE", "MERGE", "REPLACE", "UPSERT":
+		return fmt.Errorf("write operations are not allowed (%s)", kw)
+	case "DROP", "ALTER", "CREATE", "TRUNCATE", "RENAME", "COMMENT":
+		return fmt.Errorf("DDL operations are not allowed (%s)", kw)
+	case "EXEC", "EXECUTE", "CALL":
+		return fmt.Errorf("procedure execution must use the execute_procedure tool, not inline %s", kw)
+	case "GRANT", "REVOKE":
+		return fmt.Errorf("permission statements are not allowed (%s)", kw)
+	case "USE", "SET", "DECLARE", "BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT":
+		return fmt.Errorf("session/control statements are not allowed (%s)", kw)
+	case "LOAD", "COPY", "BULK", "BACKUP", "RESTORE", "DBCC", "SHUTDOWN", "KILL":
+		return fmt.Errorf("data-movement / admin statements are not allowed (%s)", kw)
+	default:
+		return fmt.Errorf("query rejected: only SELECT and WITH (CTE) statements are accepted (got %q)", kw)
 	}
+}
 
-	return nil
+// firstKeyword returns the first SQL identifier (uppercased) at the start of
+// the query — after stripping comments, string literals, leading whitespace,
+// and leading opening parentheses. Returns "" if the query has no
+// identifier-shaped token at the start.
+//
+// Leading parens are skipped so wrappers like "(SELECT …)" or
+// "((SELECT a) UNION (SELECT b))" classify correctly as SELECT-shaped.
+func firstKeyword(query string) string {
+	s := stripCommentsAndStrings(query)
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		if c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '(' {
+			i++
+			continue
+		}
+		break
+	}
+	if i >= len(s) {
+		return ""
+	}
+	j := i
+	for j < len(s) {
+		c := s[j]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' {
+			j++
+			continue
+		}
+		break
+	}
+	if j == i {
+		return ""
+	}
+	return strings.ToUpper(s[i:j])
+}
+
+// hasMultipleStatements reports whether `query` contains a statement separator
+// (";") outside of string literals or comments. A single trailing semicolon
+// is tolerated since it is a common, harmless idiom.
+func hasMultipleStatements(query string) bool {
+	stripped := stripCommentsAndStrings(query)
+	stripped = strings.TrimRight(stripped, "; \t\n\r")
+	return strings.ContainsRune(stripped, ';')
+}
+
+// stripCommentsAndStrings removes /* */ block comments, -- line comments, and
+// single-quoted string literals (including the SQL standard '' escape) so the
+// remaining text can be scanned for structural tokens like ';' without being
+// fooled by content hidden inside strings or comments.
+//
+// Replacements are written as a single space so adjacent tokens never fuse —
+// "EX/**/EC" becomes "EX EC", not "EXEC".
+func stripCommentsAndStrings(query string) string {
+	var b strings.Builder
+	b.Grow(len(query))
+	i, n := 0, len(query)
+	for i < n {
+		c := query[i]
+
+		// /* ... */ block comment
+		if c == '/' && i+1 < n && query[i+1] == '*' {
+			j := strings.Index(query[i+2:], "*/")
+			if j < 0 {
+				b.WriteByte(' ')
+				return b.String()
+			}
+			i += 2 + j + 2
+			b.WriteByte(' ')
+			continue
+		}
+
+		// -- line comment
+		if c == '-' && i+1 < n && query[i+1] == '-' {
+			j := strings.IndexByte(query[i+2:], '\n')
+			if j < 0 {
+				b.WriteByte(' ')
+				return b.String()
+			}
+			i += 2 + j + 1
+			b.WriteByte(' ')
+			continue
+		}
+
+		// 'string literal' with '' escape
+		if c == '\'' {
+			i++
+			for i < n {
+				if query[i] == '\'' {
+					if i+1 < n && query[i+1] == '\'' {
+						i += 2 // escaped single quote
+						continue
+					}
+					i++ // closing quote
+					break
+				}
+				i++
+			}
+			b.WriteByte(' ')
+			continue
+		}
+
+		b.WriteByte(c)
+		i++
+	}
+	return b.String()
 }
 
 // PIIMasker masks personally identifiable information in query results.
@@ -242,162 +372,42 @@ func NewQueryModifier(maxRowLimit int) *QueryModifier {
 	}
 }
 
-// AddRowLimit adds a LIMIT clause to a query if it doesn't already have one.
+// trailingLimitRe matches a "LIMIT N" (optionally followed by "OFFSET M") at
+// the very end of the query. Anchoring on $ means a LIMIT clause inside a
+// subquery is not mistaken for the outer cap — those queries get a fresh
+// outer LIMIT appended.
+var trailingLimitRe = regexp.MustCompile(`(?i)\bLIMIT\s+(\d+)(?:\s+OFFSET\s+\d+)?\s*$`)
+
+// AddRowLimit ensures the query carries a top-level "LIMIT N" no larger than
+// maxRowLimit.
+//
+// The modifier is dialect-agnostic and uses string manipulation only — it
+// does not pull in a SQL parser. Behaviour:
+//   - Trailing whitespace and a single trailing ';' are tolerated and stripped.
+//   - If a trailing "LIMIT N [OFFSET M]" already exists with N <= maxRowLimit,
+//     the query is returned unchanged.
+//   - If N exceeds the cap, only the numeric token is replaced; OFFSET and
+//     anything before LIMIT are preserved.
+//   - Otherwise " LIMIT maxRowLimit" is appended.
+//
+// On MSSQL the adapter strips this LIMIT and rewrites it as SELECT TOP N
+// (see pkg/adapter/mssql/mssql.go adaptQueryForVersion). Subquery LIMITs
+// inside the query body are left alone — only the outermost cap is managed.
 func (qm *QueryModifier) AddRowLimit(query string) (string, error) {
-	// xwb1989/sqlparser is MySQL-dialect; round-tripping a T-SQL query through
-	// sqlparser.String can mangle MSSQL-specific syntax (brackets, NOLOCK hints,
-	// N'...' literals, OUTPUT clauses). When the query looks like T-SQL, skip the
-	// AST path entirely and use the regex-based rewriter, which only edits the
-	// LIMIT/TOP/FETCH numeric tokens and leaves everything else intact.
-	if looksLikeMSSQL(strings.ToUpper(query)) {
-		return qm.addRowLimitSimple(query), nil
-	}
+	q := strings.TrimRight(strings.TrimSpace(query), ";")
+	q = strings.TrimSpace(q)
 
-	// Parse the query
-	stmt, err := sqlparser.Parse(query)
-	if err != nil {
-		// Fallback to simple string append if parsing fails
-		return qm.addRowLimitSimple(query), nil
-	}
-
-	switch s := stmt.(type) {
-	case *sqlparser.Select:
-		// If the query already has a LIMIT that is within the allowed maximum, keep it.
-		// If the existing limit exceeds the maximum, override it to prevent overload.
-		if s.Limit != nil && s.Limit.Rowcount != nil {
-			if limVal, ok := s.Limit.Rowcount.(*sqlparser.SQLVal); ok && limVal.Type == sqlparser.IntVal {
-				existing, err := strconv.Atoi(string(limVal.Val))
-				if err == nil && existing <= qm.maxRowLimit {
-					return query, nil
-				}
-			}
-		}
-
-		// Add or override LIMIT clause, preserving any existing OFFSET
-		var existingOffset sqlparser.Expr
-		if s.Limit != nil {
-			existingOffset = s.Limit.Offset
-		}
-
-		s.Limit = &sqlparser.Limit{
-			Offset:   existingOffset,
-			Rowcount: sqlparser.NewIntVal([]byte(fmt.Sprintf("%d", qm.maxRowLimit))),
-		}
-
-		return sqlparser.String(s), nil
-
-	case *sqlparser.Union:
-		// Appending "LIMIT N" directly to a UNION would only cap the trailing
-		// SELECT after the MSSQL adapter rewrites LIMIT→TOP. Wrap the whole
-		// UNION in a subquery so the cap applies to the combined result set
-		// regardless of dialect.
-		return fmt.Sprintf("SELECT * FROM (%s) AS _capped LIMIT %d", query, qm.maxRowLimit), nil
-
-	default:
-		return query, nil
-	}
-}
-
-// limitRe matches a LIMIT clause with its numeric value, optionally followed by an OFFSET.
-// Used by addRowLimitSimple to safely replace only the row-count token.
-var (
-	limitRe           = regexp.MustCompile(`(?i)\bLIMIT\s+(\d+)`)
-	mssqlSelectRe     = regexp.MustCompile(`(?i)\bSELECT\s+(DISTINCT\s+)?`)
-	mssqlTopRe        = regexp.MustCompile(`(?i)\bSELECT\s+(DISTINCT\s+)?TOP\s+\d+\b`)
-	mssqlFetchRe      = regexp.MustCompile(`(?i)\bFETCH\s+NEXT\s+\d+\s+ROWS?\s+ONLY\b`)
-	mssqlTopValueRe   = regexp.MustCompile(`(?i)(\bTOP\s+)(\d+)\b`)
-	mssqlFetchValueRe = regexp.MustCompile(`(?i)(\bFETCH\s+NEXT\s+)(\d+)(\s+ROWS?\s+ONLY\b)`)
-)
-
-// addRowLimitSimple adds or overrides the LIMIT clause using simple string
-// manipulation. It is used as a fallback when the SQL parser cannot parse the
-// query (e.g., dialect-specific syntax). Any existing LIMIT that exceeds
-// maxRowLimit is replaced so the cap is enforced consistently.
-// OFFSET and any other clauses that follow the LIMIT value are preserved.
-func (qm *QueryModifier) addRowLimitSimple(query string) string {
-	q := strings.TrimSpace(query)
-	upper := strings.ToUpper(q)
-
-	if m := limitRe.FindStringSubmatchIndex(q); m != nil {
-		// m[2]:m[3] is the capture group holding the numeric value.
+	if m := trailingLimitRe.FindStringSubmatchIndex(q); m != nil {
 		existing, err := strconv.Atoi(q[m[2]:m[3]])
 		if err == nil && existing <= qm.maxRowLimit {
-			// Existing limit is within the allowed maximum — keep query unchanged.
-			return query
+			// Existing trailing LIMIT is within the cap — keep query unchanged
+			// (preserving any trailing semicolon the caller had).
+			return query, nil
 		}
-		// Replace only the numeric token; preserve everything before and after.
-		return q[:m[2]] + strconv.Itoa(qm.maxRowLimit) + q[m[3]:]
+		// Replace only the numeric token; everything before and after
+		// (OFFSET clause, trailing whitespace) is preserved.
+		return q[:m[2]] + strconv.Itoa(qm.maxRowLimit) + q[m[3]:], nil
 	}
 
-	if looksLikeMSSQL(upper) {
-		return qm.addRowLimitMSSQL(q)
-	}
-
-	// No LIMIT found — append one.
-	return fmt.Sprintf("%s LIMIT %d", q, qm.maxRowLimit)
-}
-
-// looksLikeMSSQL is a best-effort heuristic that flags queries containing
-// T-SQL-specific syntax (NOLOCK hint, TOP/FETCH NEXT, bracketed identifiers,
-// or common MSSQL types/functions). False positives are harmless because they
-// only steer the row-cap rewriter toward the regex-based path that preserves
-// the original query verbatim.
-func looksLikeMSSQL(upperQuery string) bool {
-	if strings.Contains(upperQuery, "WITH (NOLOCK)") {
-		return true
-	}
-	if mssqlFetchRe.MatchString(upperQuery) {
-		return true
-	}
-	if strings.Contains(upperQuery, "TOP ") {
-		return true
-	}
-	if strings.Contains(upperQuery, "NVARCHAR") || strings.Contains(upperQuery, "GETDATE()") {
-		return true
-	}
-	if strings.Contains(upperQuery, "[") && strings.Contains(upperQuery, "]") {
-		return true
-	}
-	return false
-}
-
-func (qm *QueryModifier) addRowLimitMSSQL(query string) string {
-	if mssqlTopRe.MatchString(query) {
-		return mssqlTopValueRe.ReplaceAllStringFunc(query, func(match string) string {
-			parts := mssqlTopValueRe.FindStringSubmatch(match)
-			if len(parts) != 3 {
-				return match
-			}
-			existing, err := strconv.Atoi(parts[2])
-			if err != nil || existing <= qm.maxRowLimit {
-				return match
-			}
-			return fmt.Sprintf("%s%d", parts[1], qm.maxRowLimit)
-		})
-	}
-	if mssqlFetchRe.MatchString(query) {
-		return mssqlFetchValueRe.ReplaceAllStringFunc(query, func(match string) string {
-			parts := mssqlFetchValueRe.FindStringSubmatch(match)
-			if len(parts) != 4 {
-				return match
-			}
-			existing, err := strconv.Atoi(parts[2])
-			if err != nil || existing <= qm.maxRowLimit {
-				return match
-			}
-			return fmt.Sprintf("%s%d%s", parts[1], qm.maxRowLimit, parts[3])
-		})
-	}
-
-	loc := mssqlSelectRe.FindStringSubmatchIndex(query)
-	if loc == nil {
-		return query
-	}
-
-	insertAt := loc[1]
-	if len(loc) >= 4 && loc[2] != -1 {
-		insertAt = loc[3]
-	}
-
-	return query[:insertAt] + fmt.Sprintf("TOP %d ", qm.maxRowLimit) + query[insertAt:]
+	return fmt.Sprintf("%s LIMIT %d", q, qm.maxRowLimit), nil
 }

@@ -8,7 +8,6 @@ require (
 	github.com/microsoft/go-mssqldb v1.9.6
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
-	github.com/xwb1989/sqlparser v0.0.0-20180606152119-120387863bf2
 )
 
 require (

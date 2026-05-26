@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.9] - 2026-05-26
+
+### Security
+- **Query validator rewritten as a T-SQL aware lexer.** The previous implementation combined `xwb1989/sqlparser` (MySQL dialect, unmaintained since 2018) with a regex denylist fallback. The fallback was bypassable via comment/whitespace tricks — `SELECT 1; EX/**/EC xp_cmdshell …` slipped past the regex because the engine sees `EX/**/EC` while SQL Server treats `/**/` as whitespace and executes the statement. Switching to vitess/cockroachdb parsers only moves the problem since every dialect-aware parser has corner cases where it cannot parse legitimate target-DB queries.
+- **New validator posture** (`pkg/security/security.go`):
+  1. Multi-statement payloads rejected — any `;` outside string literals or comments (other than a single trailing one) is fatal, blocking stacked-query attacks dialect-independently.
+  2. Leading keyword classified after stripping comments and string literals — only `SELECT` and `WITH` (CTE) pass. Every other recognised statement keyword returns a specific error.
+  3. Forbidden-in-body scan for `SELECT…INTO`, `OPENROWSET`, `OPENQUERY`, `OPENDATASOURCE` — the actual T-SQL write/exfiltration vectors that turn a SELECT-shaped statement into something dangerous.
+- **Token-fusion protection:** `stripCommentsAndStrings` replaces stripped content with a single space so adjacent identifiers never fuse — `EX/**/EC` becomes `EX EC`, not `EXEC`.
+- **`xwb1989/sqlparser` dependency removed** from `go.mod` / `go.sum`. No third-party SQL parser is required.
+
+### Added
+- **Bypass test suite** (`pkg/security/security_test.go`): explicit coverage for the bypass classes that motivated the rewrite — stacked statements after a `SELECT` prefix, `EX/**/EC` split by inline comment, `EXEC` hidden behind a block-comment prefix, `DROP` after a `--` line-comment terminator, stacked statements via single-quoted decoy, unparseable garbage. Also covers `SELECT…INTO` (T-SQL temp table, MySQL `OUTFILE`/`DUMPFILE`), `OPENROWSET`/`OPENQUERY`/`OPENDATASOURCE`, and CTE exfil via `SELECT…INTO`.
+- **False-positive guards** in the test suite: forbidden tokens hidden inside `/* */` or single-quoted string literals do NOT trigger rejection (they are stripped before the body scan). Verifies the stripped-then-classified design.
+- **`firstKeyword` and `stripCommentsAndStrings` unit tests** covering paren-wrapped UNION, T-SQL `SELECT TOP`, bracketed identifiers (`[dbo].[users]`), comment prefixes, and adjacent-token-fusion edge cases.
+
+### Changed
+- `NewQueryValidator(allowedKeywords, blockedKeywords)` signature preserved for backwards compatibility — the cloud control plane and existing `coremcp.yaml` files still reference these fields, but they are no longer consulted by the validator. The slices are retained on the struct (with `//nolint:unused`) so `config_sync` payloads continue to deserialise without breakage.
+- Validator error messages are now operation-specific (`"write operations are not allowed (UPDATE)"`, `"DDL operations are not allowed (DROP)"`, `"procedure execution must use the execute_procedure tool, not inline EXEC"`, etc.) instead of a generic blocked-keyword string.
+
+### Notes
+- CTE bodies are NOT introspected for nested DML keywords. For PostgreSQL, a CTE may legally contain `DELETE … RETURNING` — the line of defence is the DB user's permission set (the README requires a SELECT-only user, and the cloud-direct adapter additionally pins the session to `default_transaction_read_only`). MSSQL CTEs are SELECT-only at the grammar level, so the primary target is unaffected.
+
 ## [0.4.8] - 2026-05-26
 
 ### Fixed

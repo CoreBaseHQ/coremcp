@@ -162,7 +162,7 @@ security:
 
 What this enables:
 
-- **AST-based query validation.** SQL is parsed; `DROP`, `ALTER`, `UPDATE`, `DELETE`, `TRUNCATE`, `EXEC`, etc. are rejected before reaching the DB. Treat as one layer, not the only layer — pair with a least-privilege DB role.
+- **T-SQL aware lexer.** Fail-closed custom tokeniser strips comments and string literals, then classifies the statement — only `SELECT` and `WITH` pass. `DROP`, `ALTER`, `UPDATE`, `DELETE`, `TRUNCATE`, `EXEC`, `OPENROWSET`, `SELECT…INTO` and similar are rejected before reaching the DB. Multi-statement payloads (any `;` outside strings/comments) are fatal — stacked-query attacks blocked dialect-independently. Chosen over third-party Go SQL parsers (xwb1989/sqlparser, vitess, cockroachdb) because they fail-closed on T-SQL hints and any "fall through to regex" relaxation is bypassable via `EX/**/EC` and similar tricks. Treat as one layer, not the only layer — pair with a least-privilege DB role.
 - **Forced row cap.** `LIMIT` is appended (or wrapped) on every SELECT so a model never streams millions of rows back through the protocol.
 - **PII masking.** Regex-based post-processing on result strings before they reach the client.
 
@@ -362,7 +362,7 @@ On startup CoreMCP connects to every configured source, scans tables / columns /
 - [x] Column comments / descriptions
 - [x] Built-in `list_tables` / `describe_table`
 - [x] Custom parameterized tools
-- [x] AST-based query sanitization
+- [x] T-SQL aware lexer for query sanitization (fail-closed, multi-statement reject, no third-party parser)
 - [x] PII masking
 - [x] Forced row cap
 - [x] WebSocket `connect` mode
