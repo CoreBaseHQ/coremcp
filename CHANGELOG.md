@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-05-27
+
+### Added
+- **PostgreSQL adapter** (`pkg/adapter/postgres`). Full `core.Source` implementation backed by `pgx/v5/stdlib` — the actively-maintained PostgreSQL driver. Feature parity with the MSSQL adapter:
+  - Schema discovery: tables, columns, PKs, FKs via `information_schema`. Column comments sourced from `pg_description` (`COMMENT ON COLUMN`).
+  - View discovery: `list_views` with column definitions.
+  - Procedure/function discovery: `list_procedures` enumerates both `PROCEDURE` (PG 11+) and `FUNCTION` routine types. Overloaded functions are de-duplicated by `routine_name`; parameters are joined via `specific_name` to correctly associate params with each overload.
+  - `ExecuteProcedure`: attempts `CALL proc_name(param => $N)` first (PG 11+ native PROCEDURE); falls back to `SELECT * FROM proc_name(param => $N)` for functions and older servers. Parameters sorted alphabetically for deterministic `$N` binding — no string interpolation.
+  - `ExecuteQuery`: passes SQL through unchanged. PostgreSQL natively supports `LIMIT N`, so no dialect rewrite is needed (contrast with the MSSQL `LIMIT → TOP` transformation).
+  - Procedure/parameter name validation (`^[a-zA-Z_][a-zA-Z0-9_.]*$` / `^[a-zA-Z_][a-zA-Z0-9_]*$`) fires before any DB call.
+- **Factory registration**: `type: "postgres"` and `type: "postgresql"` both route to the new adapter. `noLock` and `normalizeTurkish` config keys are accepted (and silently ignored) so mixed-source `coremcp.yaml` files don't need special-casing.
+- **DSN format** documented in README: `postgresql://user:password@host:port/dbname?sslmode=disable`.
+
+### Changed
+- README **Status** section: PostgreSQL adapter listed as Stable; removed from Roadmap.
+- README **Source options** table: `type` now lists `mssql`, `postgres`/`postgresql`, `rest`, `graphql`, `dummy`.
+
 ## [0.4.9] - 2026-05-26
 
 ### Security

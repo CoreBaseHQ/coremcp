@@ -7,12 +7,13 @@ import (
 	"github.com/corebasehq/coremcp/pkg/adapter/dummy"
 	"github.com/corebasehq/coremcp/pkg/adapter/graphql"
 	"github.com/corebasehq/coremcp/pkg/adapter/mssql"
+	"github.com/corebasehq/coremcp/pkg/adapter/postgres"
 	"github.com/corebasehq/coremcp/pkg/adapter/rest"
 	"github.com/corebasehq/coremcp/pkg/core"
 )
 
 // NewSource creates a new database adapter based on the specified type.
-// Supported types: "dummy", "mssql", "rest", "graphql", "firebird" (coming soon).
+// Supported types: "dummy", "mssql", "postgres"/"postgresql", "rest", "graphql", "firebird" (coming soon).
 // noLock enables READ UNCOMMITTED isolation for MSSQL sources (equivalent to WITH (NOLOCK)).
 // normalizeTurkish enables Turkish character normalization middleware for legacy Turkish_CI_AS databases.
 // Returns an error if the database type is unsupported or initialization fails.
@@ -22,6 +23,8 @@ func NewSource(dbType string, dsn string, noLock bool, normalizeTurkish bool) (c
 		return dummy.New(dsn)
 	case "mssql":
 		return mssql.New(dsn, noLock, normalizeTurkish)
+	case "postgres", "postgresql":
+		return postgres.New(dsn)
 	case "rest":
 		return rest.New(dsn)
 	case "graphql":

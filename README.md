@@ -7,13 +7,13 @@
 
 A Model Context Protocol (MCP) server, written in Go, that exposes SQL databases as MCP tools and prompts. It runs as a single static binary, embeds its drivers, and talks either stdio (for local MCP clients like Claude Desktop) or an outbound WebSocket (for remote operation behind NAT).
 
-Currently ships with an MSSQL adapter (SQL Server 2000+, `Turkish_CI_AS` collation aware). Firebird is in progress; PostgreSQL and MySQL are on the roadmap.
+Currently ships with MSSQL (SQL Server 2000+, `Turkish_CI_AS` collation aware) and PostgreSQL adapters. Firebird is in progress; MySQL is on the roadmap.
 
 ## Status
 
-- **Stable:** MSSQL adapter, stdio transport, schema discovery, custom tools, NOLOCK / Turkish normalization middleware, WebSocket connect mode.
+- **Stable:** MSSQL adapter, PostgreSQL adapter, stdio transport, schema discovery, custom tools, NOLOCK / Turkish normalization middleware, WebSocket connect mode.
 - **In progress:** Firebird adapter (factory currently returns a placeholder error).
-- **Roadmap:** PostgreSQL, MySQL, HTTP transport, audit log, query result cache.
+- **Roadmap:** MySQL, HTTP transport, audit log, query result cache.
 
 ## Defaults
 
@@ -83,6 +83,12 @@ MSSQL:
 sqlserver://username:password@host:port?database=dbname&encrypt=disable
 ```
 
+PostgreSQL:
+
+```
+postgresql://username:password@host:port/dbname?sslmode=disable
+```
+
 Dummy adapter (for testing without a real DB):
 
 ```
@@ -94,7 +100,7 @@ dummy://test
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `name` | string | — | Unique source identifier |
-| `type` | string | — | Adapter type: `mssql`, `dummy` |
+| `type` | string | — | Adapter type: `mssql`, `postgres` (or `postgresql`), `rest`, `graphql`, `dummy` |
 | `dsn` | string | — | Connection string |
 | `readonly` | bool | `true` | SELECT-only at the config level. Set `false` explicitly to allow `execute_procedure`. |
 | `no_lock` | bool | `false` | **(MSSQL only)** Run SELECTs under `READ UNCOMMITTED`. Equivalent to `WITH (NOLOCK)` on every table reference. Eliminates shared lock acquisition on busy OLTP. **Trade-off:** dirty reads possible. |
@@ -371,8 +377,8 @@ On startup CoreMCP connects to every configured source, scans tables / columns /
 - [x] NOLOCK / READ UNCOMMITTED per source (MSSQL)
 - [x] Turkish character + mojibake middleware (MSSQL)
 - [x] View and procedure discovery (`list_views`, `list_procedures`, `execute_procedure`)
+- [x] PostgreSQL adapter
 - [ ] Firebird adapter (in progress)
-- [ ] PostgreSQL adapter
 - [ ] MySQL adapter
 - [ ] HTTP transport
 - [ ] Query result cache
