@@ -405,4 +405,6 @@ Apache License 2.0 — see [LICENSE](LICENSE).
 
 ## About
 
-CoreMCP is the on-prem agent component of [CoreBase](https://corebasehq.com) — memory infrastructure for the AI agents your customers use. CoreBase gives those agents structured access to operational systems (SQL Server 2000+, REST, GraphQL, Slack, Microsoft 365) and layers Corporate Memory on top: the schema relationships, terminology, and proven query patterns that turn raw access into accurate answers.
+CoreMCP is the open-source, on-prem gateway component of [CoreBase](https://corebasehq.com), an AI agent platform for your company's data. Chat with your databases and APIs directly, or let autonomous and event-triggered agents run multi-step automations across them — databases (SQL Server 2000+, PostgreSQL), REST and GraphQL APIs, and 50+ SaaS connectors.
+
+CoreMCP is how those agents reach the systems behind your firewall, including the legacy and on-prem ones nothing else connects to: it runs on your own server, keeps database credentials local, and connects zero-trust — outbound port 443 only, no inbound ports. On top of that access, CoreBase layers Unified Context and Query Memory: the schema relationships, terminology, and proven query patterns that turn raw access into accurate answers.
